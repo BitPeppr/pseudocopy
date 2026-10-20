@@ -107,18 +107,34 @@ func isExpired(created: Date?, modified: Date?, now: Date, ttl: TimeInterval) ->
 
 // MARK: - Paths
 
-/// Normalized state key for a file: absolute, symlink free, no trailing slash.
+/// Normalized state key for a file: absolute, standardized, no trailing slash.
+///
+/// The watch folder is already resolved when the configuration is built, so
+/// the paths below it do not need to be resolved again — that would cost one
+/// `lstat` per path component for every file, every cycle.
 func normalizedPath(_ url: URL) -> String {
-    url.standardizedFileURL.resolvingSymlinksInPath().path
+    url.standardizedFileURL.path
 }
 
 /// Human readable path, with the home directory abbreviated to `~`.
+///
+/// Newlines and tabs are escaped: a file name may contain them, and they
+/// would break the one-line-per-event log format (§2.5).
 func displayPath(_ url: URL) -> String {
     let path = url.path
     let home = NSHomeDirectory()
-    if path == home { return "~" }
-    if path.hasPrefix(home + "/") { return "~" + path.dropFirst(home.count) }
-    return path
+    var shown: String
+    if path == home {
+        shown = "~"
+    } else if path.hasPrefix(home + "/") {
+        shown = "~" + path.dropFirst(home.count)
+    } else {
+        shown = path
+    }
+    return shown
+        .replacingOccurrences(of: "\n", with: "\\n")
+        .replacingOccurrences(of: "\r", with: "\\r")
+        .replacingOccurrences(of: "\t", with: "\\t")
 }
 
 // MARK: - Process lock (§2.6)
@@ -206,16 +222,25 @@ private func scanEntries(_ dir: URL, previous: [String: Fingerprint]) throws -> 
 
     if !exists {
         let parent = dir.deletingLastPathComponent()
-        if FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDirectory), isDirectory.boolValue {
+        // A folder under /Volumes is the convention for an external drive:
+        // if it is gone, the volume is probably not mounted, and creating it
+        // again would put a stray folder on the root volume.
+        let isVolumePath = parent.path == "/Volumes" || parent.path.hasPrefix("/Volumes/")
+        if !isVolumePath,
+           FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDirectory), isDirectory.boolValue {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
                                                      attributes: [.posixPermissions: 0o700])
             Logger.verboseLog(.error, "dir", "recreated the watch directory \(dir.path)")
-        } else if isRunningAsAgent() {
-            // The volume is not mounted — there is nothing to do and nobody to
-            // tell: the agent would otherwise log this every five seconds.
-            Logger.verboseLog(.error, "dir", "watch directory \(dir.path) is unavailable")
-            return []
-        } else {
+        }
+        // The folder may still be missing — for instance when it points into
+        // a volume that is not mounted.
+        guard FileManager.default.fileExists(atPath: dir.path) else {
+            if isRunningAsAgent() {
+                // The volume is not mounted — there is nothing to do and nobody
+                // to tell: the agent would otherwise log this every five seconds.
+                Logger.verboseLog(.error, "dir", "watch directory \(dir.path) is unavailable")
+                return []
+            }
             throw CLIError.usage("watch directory does not exist: \(dir.path)")
         }
     } else if !isDirectory.boolValue {
@@ -254,7 +279,8 @@ private func scanEntries(_ dir: URL, previous: [String: Fingerprint]) throws -> 
 
 /// True when this process was started by the LaunchAgent.
 func isRunningAsAgent() -> Bool {
-    ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] == Constants.agentLabel
+    guard let service = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] else { return false }
+    return service == Constants.agentLabel || service.hasSuffix("/" + Constants.agentLabel)
 }
 
 /// True when the reaper may act on a file (§2.3).
@@ -332,12 +358,18 @@ private func performCycle(config: Configuration, clipping: Bool, force: Bool) th
             // and is copied then.
             for entry in entries {
                 guard let current = entry.fingerprint else { continue }
+                // A file that is already older than the TTL is not marked as
+                // handled: it still has to settle and be copied, so that the
+                // user gets its content before it is reaped.
+                guard !isExpired(created: entry.created, modified: entry.modified, now: now, ttl: config.ttl) else {
+                    continue
+                }
                 var record = records[entry.path] ?? StateRecord(lastFingerprint: current, clippedFingerprint: nil)
                 record.lastFingerprint = current
                 record.clippedFingerprint = current
                 records[entry.path] = record
             }
-            Logger.verboseLog(.scan, "state", "the state was rebuilt — the files that were already there are not copied")
+            Logger.log(.state, "state", "the state was rebuilt — the files that were already there are not copied")
         } else {
             for entry in entries {
                 guard case .settled = entry.verification, let current = entry.fingerprint else {
@@ -353,8 +385,13 @@ private func performCycle(config: Configuration, clipping: Bool, force: Bool) th
                 do {
                     written = try putOnClipboard(kind: kind, url: entry.url, embedLimit: config.embedLimitBytes)
                 } catch {
-                    // The file stays unclipped and is retried on the next cycle.
-                    Logger.log(.error, "clip", "\(displayPath(entry.url)): \(error.localizedDescription)")
+                    // The file stays unclipped and is retried on the next
+                    // cycle. A failure that repeats is only reported once a
+                    // minute, so that a stuck file cannot fill the log.
+                    if store.shouldReportError(path: entry.path) {
+                        Logger.log(.error, "clip", "\(displayPath(entry.url)): \(error.localizedDescription)")
+                    }
+                    store.noteError(path: entry.path)
                     continue
                 }
                 Logger.log(.clip, written.rawValue, displayPath(entry.url))
@@ -380,8 +417,13 @@ private func performCycle(config: Configuration, clipping: Bool, force: Bool) th
             Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) expired but not settled, keeping it")
             continue
         }
-        // Safety net: the file must not have changed since the scan.
-        guard let current = try? fingerprint(of: entry.url), current == observed else {
+        // Safety net: the file must not have changed since the scan. A fresh
+        // URL is used on purpose — the resource values of the URL that came
+        // from the directory listing are cached, so asking the same object
+        // again would return the values from the scan and never notice a
+        // change.
+        let fresh = URL(fileURLWithPath: entry.url.path)
+        guard let current = try? fingerprint(of: fresh), current == observed else {
             Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) still changing, keeping it")
             continue
         }
@@ -432,6 +474,7 @@ private func performCycle(config: Configuration, clipping: Bool, force: Bool) th
     }
     store.setRecords(records)
     store.setLastScan(scan)
+    store.markSeen()
     store.prune(missing: missing)
     do {
         try store.save()
@@ -466,23 +509,35 @@ func clipPaths(_ paths: [String], config: Configuration) throws {
     guard !paths.isEmpty else {
         throw CLIError.usage("clip needs at least one file path")
     }
-    for (index, path) in paths.enumerated() {
+
+    var urls: [URL] = []
+    var kinds: [FileKind] = []
+    var failures = 0
+    for path in paths {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
             .standardizedFileURL
             .resolvingSymlinksInPath()
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
-            throw CLIError.usage("not a file: \(path)")
+            // One bad path does not stop the others.
+            Logger.log(.error, "clip", "not a file: \(path)")
+            failures += 1
+            continue
         }
-        let kind = classifyFile(url)
-        // The pasteboard is emptied once, so that several files can be put on
-        // it at the same time.
-        let written = try writeToPasteboard(
-            kind: kind,
-            url: url,
-            embedLimit: config.embedLimitBytes,
-            clearing: index == 0
-        )
-        Logger.log(.clip, written.rawValue, displayPath(url))
+        urls.append(url)
+        kinds.append(classifyFile(url))
+    }
+    guard !urls.isEmpty else {
+        throw CLIError.usage("none of the given paths is a file")
+    }
+
+    // One transaction for all files: a pasteboard holds one value per type,
+    // but every file is offered as a file reference.
+    let written = try putFilesOnClipboard(kinds: kinds, urls: urls, embedLimit: config.embedLimitBytes)
+    for (index, url) in urls.enumerated() {
+        Logger.log(.clip, written[index].rawValue, displayPath(url))
+    }
+    if failures > 0 {
+        throw CLIError.usage("\(failures) path(s) could not be clipped")
     }
 }

@@ -118,6 +118,12 @@ func installAgent(config: Configuration) throws {
                                     attributes: [.posixPermissions: 0o700])
     try fileManager.createDirectory(at: AgentPaths.launchAgentsDirectory, withIntermediateDirectories: true)
     try fileManager.createDirectory(at: AgentPaths.logsDirectory, withIntermediateDirectories: true)
+    // The log lists the names of the files that were copied — keep it
+    // readable by the user only.
+    if !fileManager.fileExists(atPath: AgentPaths.logURL.path) {
+        fileManager.createFile(atPath: AgentPaths.logURL.path, contents: nil)
+    }
+    try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: AgentPaths.logURL.path)
 
     let plist = try launchAgentPlist(
         binaryPath: executablePath(),

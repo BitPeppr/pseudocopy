@@ -46,6 +46,18 @@ for path in records:
 PY
 }
 
+# True when the state store has a namespace for this watch folder.
+state_namespace_exists() {
+    python3 - "$STATE_FILE" "$1" <<'PY' 2>/dev/null || exit 1
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if sys.argv[2] in data.get("dirs", {}) else 1)
+PY
+}
+
 # --- clipboard backup ------------------------------------------------------
 CLIP_BACKUP="${LOG_DIR}/clipboard.txt"
 if pbpaste > "${CLIP_BACKUP}" 2>/dev/null; then
@@ -71,7 +83,18 @@ pass "swift build"
 
 # --- sandbox ---------------------------------------------------------------
 echo "==> sandbox: ${SANDBOX}"
+# The tool keys the state store with the resolved path, and Foundation maps
+# /private/var back to /var — the lookup below has to use the same spelling,
+# otherwise the assertions would pass because they find nothing.
 NS_KEY="$(cd "${SANDBOX}" && pwd -P)"
+NS_KEY="${NS_KEY#/private}"
+
+# The first cycle of a new watch folder only establishes the store: files
+# that were already there are treated as leftovers and are not copied onto
+# the clipboard. Warming the folder up first is what the agent does on its
+# own, seconds after it is installed.
+"${BIN}" run --dir "${SANDBOX}" --ttl 3600 >/dev/null 2>&1
+
 printf 'pseudocopy smoke test\n' > "${SANDBOX}/sample.txt"
 printf 'partial download in progress\n' > "${SANDBOX}/sample.still-downloading.crdownload"
 printf 'partial download in progress\n' > "${SANDBOX}/sample.part"
@@ -82,7 +105,7 @@ printf 'pseudocopy-smoke-marker\n' | pbcopy
 
 # --- cycle 1: the file is still settling ------------------------------------
 echo "==> cycle 1 (settling)"
-"${BIN}" run --dir "${SANDBOX}" --ttl 1 --verbose > "${LOG_DIR}/run1.log" 2>&1
+"${BIN}" run --dir "${SANDBOX}" --ttl 3600 --verbose > "${LOG_DIR}/run1.log" 2>&1
 check_eq "cycle 1 exits 0" "0" "$?"
 check_eq "cycle 1 does not clip yet" "pseudocopy-smoke-marker" "$(pbpaste)"
 if grep -q "settling" "${LOG_DIR}/run1.log"; then
@@ -93,7 +116,7 @@ fi
 
 # --- cycle 2: the file is clipped ------------------------------------------
 echo "==> cycle 2 (clip)"
-"${BIN}" run --dir "${SANDBOX}" --ttl 1 --verbose > "${LOG_DIR}/run2.log" 2>&1
+"${BIN}" run --dir "${SANDBOX}" --ttl 3600 --verbose > "${LOG_DIR}/run2.log" 2>&1
 check_eq "cycle 2 exits 0" "0" "$?"
 check_eq "cycle 2 puts the text on the clipboard" "pseudocopy smoke test" "$(pbpaste)"
 if grep -q "\[clip\] text" "${LOG_DIR}/run2.log"; then
@@ -105,7 +128,7 @@ fi
 # --- cycle 3: nothing is clipped twice --------------------------------------
 echo "==> cycle 3 (no re-clip)"
 printf 'pseudocopy-smoke-marker\n' | pbcopy
-"${BIN}" run --dir "${SANDBOX}" --ttl 1 --verbose > "${LOG_DIR}/run3.log" 2>&1
+"${BIN}" run --dir "${SANDBOX}" --ttl 3600 --verbose > "${LOG_DIR}/run3.log" 2>&1
 check_eq "cycle 3 leaves the clipboard alone" "pseudocopy-smoke-marker" "$(pbpaste)"
 if grep -q "\[clip\]" "${LOG_DIR}/run3.log"; then
     fail "cycle 3 does not clip again"
@@ -117,20 +140,25 @@ fi
 echo "==> exclusion rules"
 check_eq "the partial download is not clipped" "pseudocopy-smoke-marker" "$(pbpaste)"
 RECORDS="$(state_records "${NS_KEY}")"
-if [[ -z "${RECORDS}" ]] || ! grep -qE "crdownload|\.part|a-directory|a-symlink|hidden" <<< "${RECORDS}"; then
-    pass "no state record for partial downloads, dotfiles, directories or symlinks"
+if ! state_namespace_exists "${NS_KEY}"; then
+    fail "the state store knows the sandbox folder"
 else
-    fail "no state record for partial downloads, dotfiles, directories or symlinks"
+    pass "the state store knows the sandbox folder"
+    if [[ -z "${RECORDS}" ]] || ! grep -qE "crdownload|\.part|a-directory|a-symlink|hidden" <<< "${RECORDS}"; then
+        pass "no state record for partial downloads, dotfiles, directories or symlinks"
+    else
+        fail "no state record for partial downloads, dotfiles, directories or symlinks"
+    fi
 fi
 
 # --- the lock ---------------------------------------------------------------
 echo "==> process lock"
 printf 'lock test\n' > "${SANDBOX}/lock-test.txt"
-"${BIN}" run --dir "${SANDBOX}" --ttl 1 >/dev/null 2>&1   # first sighting: settling
+"${BIN}" run --dir "${SANDBOX}" --ttl 3600 >/dev/null 2>&1   # first sighting: settling
 # Two cycles at the same time: exactly one of them may clip the file.
-"${BIN}" run --dir "${SANDBOX}" --ttl 1 --verbose > "${LOG_DIR}/lock1.log" 2>&1 &
+"${BIN}" run --dir "${SANDBOX}" --ttl 3600 --verbose > "${LOG_DIR}/lock1.log" 2>&1 &
 PID1=$!
-"${BIN}" run --dir "${SANDBOX}" --ttl 1 --verbose > "${LOG_DIR}/lock2.log" 2>&1 &
+"${BIN}" run --dir "${SANDBOX}" --ttl 3600 --verbose > "${LOG_DIR}/lock2.log" 2>&1 &
 PID2=$!
 wait "${PID1}" "${PID2}"
 CLIPS="$(cat "${LOG_DIR}/lock1.log" "${LOG_DIR}/lock2.log" | grep -c "\[clip\]" || true)"

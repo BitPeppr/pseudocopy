@@ -17,6 +17,11 @@ private struct StateFile: Codable {
     var lastScan: [String: [String: Fingerprint]] = [:]
     /// watch dir -> path -> record.
     var dirs: [String: [String: StateRecord]] = [:]
+    /// watch dir -> when it was last seen. A watch folder that is only
+    /// temporarily gone (an unmounted volume) keeps its history for a while.
+    var seen: [String: Date] = [:]
+    /// path -> when the last clip error was reported, to keep the log quiet.
+    var clipErrors: [String: Date] = [:]
 }
 
 /// The persisted state store, namespaced per watch directory (§2.7).
@@ -34,6 +39,8 @@ struct StateStore {
     /// True when the store had to be built from scratch because the file was
     /// missing or damaged — every file then looks brand new.
     private(set) var wasReset = false
+    /// How long a watch folder may be gone before its history is dropped.
+    private static let namespaceGrace: TimeInterval = 24 * 3600
 
     init(watchDir: URL) {
         self.watchDir = watchDir
@@ -80,7 +87,9 @@ struct StateStore {
                 wasReset = true
             } else {
                 file = decoded
-                wasReset = false
+                // A watch folder that the store has never seen is unknown, not
+                // damaged — its files must not be copied all at once either.
+                wasReset = file.dirs[namespaceKey] == nil && file.lastScan[namespaceKey] == nil
             }
         } else {
             file = StateFile()
@@ -88,14 +97,17 @@ struct StateStore {
             var recovered = 0
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 recovered = decodeLeniently(json, decoder: decoder)
-            } else {
-                let backup = stateFileURL.appendingPathExtension("corrupt")
-                try? FileManager.default.removeItem(at: backup)
-                try? data.write(to: backup)
-                Logger.log(.error, "state", "could not decode \(stateFileURL.path); kept a copy at \(backup.path)")
             }
+            // Always keep the evidence — a file with the wrong shape is the
+            // interesting kind of damage.
+            keepCorruptCopy(data)
             if recovered > 0 {
                 Logger.log(.error, "state", "recovered \(recovered) watch folder(s) from a damaged \(stateFileURL.path)")
+            }
+            // If *this* watch folder survived, its bookkeeping is still good
+            // and its files must not be treated as new.
+            if file.dirs[namespaceKey] != nil || file.lastScan[namespaceKey] != nil {
+                wasReset = false
             }
         }
         lastWritten = try? encoder.encode(file)
@@ -108,20 +120,52 @@ struct StateStore {
 
         if let namespaces = json["dirs"] as? [String: Any] {
             for (name, value) in namespaces {
-                guard let encoded = try? JSONSerialization.data(withJSONObject: value),
-                      let records = try? decoder.decode([String: StateRecord].self, from: encoded) else { continue }
+                guard let encoded = StateStore.lenientData(value),
+                      let records = try? decoder.decode([String: StateRecord].self, from: encoded) else {
+                    Logger.log(.error, "state", "could not read the records of a watch folder; it was skipped")
+                    continue
+                }
                 file.dirs[name] = records
                 recovered += 1
             }
         }
         if let namespaces = json["lastScan"] as? [String: Any] {
             for (name, value) in namespaces {
-                guard let encoded = try? JSONSerialization.data(withJSONObject: value),
-                      let scan = try? decoder.decode([String: Fingerprint].self, from: encoded) else { continue }
+                guard let encoded = StateStore.lenientData(value),
+                      let scan = try? decoder.decode([String: Fingerprint].self, from: encoded) else {
+                    Logger.log(.error, "state", "could not read the scan of a watch folder; it was skipped")
+                    continue
+                }
                 file.lastScan[name] = scan
             }
         }
+        if let seen = json["seen"] as? [String: Date] {
+            file.seen = seen
+        }
+        if let errors = json["clipErrors"] as? [String: Date] {
+            file.clipErrors = errors
+        }
         return recovered
+    }
+
+    /// Re-serialises one namespace.
+    ///
+    /// `JSONSerialization.data(withJSONObject:)` raises an Objective-C
+    /// exception — which `try?` cannot catch, and which would abort the
+    /// process — when the value is not a container. `isValidJSONObject`
+    /// rejects those values without raising.
+    private static func lenientData(_ value: Any) -> Data? {
+        guard JSONSerialization.isValidJSONObject(value) else { return nil }
+        return try? JSONSerialization.data(withJSONObject: value)
+    }
+
+    /// Keeps a damaged state file for diagnosis.
+    private func keepCorruptCopy(_ data: Data) {
+        let backup = stateFileURL.appendingPathExtension("corrupt")
+        try? FileManager.default.removeItem(at: backup)
+        try? data.write(to: backup, options: [.atomic])
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)
+        Logger.log(.error, "state", "could not decode \(stateFileURL.path); kept a copy at \(backup.path)")
     }
 
     /// Writes the store. Nothing is written when the content did not change —
@@ -132,6 +176,7 @@ struct StateStore {
                                                 attributes: [.posixPermissions: 0o700])
         // The folder may have been created with looser permissions before.
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateFileURL.path)
         if let last = lastWritten, last == data {
             return
         }
@@ -162,12 +207,30 @@ struct StateStore {
         file.lastScan[namespaceKey] = scan
     }
 
+    /// Records that this watch folder was seen in this cycle.
+    mutating func markSeen(at date: Date = Date()) {
+        file.seen[namespaceKey] = date
+    }
+
+    /// True when the clip error for this path should be written to the log.
+    /// Repeated failures are only reported once a minute (§2.5).
+    func shouldReportError(path: String, now: Date = Date()) -> Bool {
+        guard let last = file.clipErrors[path] else { return true }
+        return now.timeIntervalSince(last) >= 60
+    }
+
+    /// Remembers that a clip error was reported.
+    mutating func noteError(path: String, at date: Date = Date()) {
+        file.clipErrors[path] = date
+    }
+
     /// Removes records whose files no longer exist (§2.3) and watch folders
     /// that are gone for good.
     mutating func prune(missing: Set<String>) {
         var records = file.dirs[namespaceKey] ?? [:]
         for path in missing {
             records.removeValue(forKey: path)
+            file.clipErrors.removeValue(forKey: path)
         }
         file.dirs[namespaceKey] = records
 
@@ -177,10 +240,16 @@ struct StateStore {
         }
         file.lastScan[namespaceKey] = scan
 
-        // Whole namespaces for watch folders that no longer exist.
+        // Whole namespaces for watch folders that no longer exist — but only
+        // after they have been gone for a while, so that an unmounted volume
+        // does not lose its history.
+        let now = Date()
         for key in file.dirs.keys where !FileManager.default.fileExists(atPath: key) {
+            let lastSeen = file.seen[key] ?? .distantPast
+            guard now.timeIntervalSince(lastSeen) >= StateStore.namespaceGrace else { continue }
             file.dirs.removeValue(forKey: key)
             file.lastScan.removeValue(forKey: key)
+            file.seen.removeValue(forKey: key)
         }
     }
 }

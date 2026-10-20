@@ -26,9 +26,9 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --prefix) PREFIX="$2"; shift 2 ;;
-        --dir)    WATCHDIR="$2"; shift 2 ;;
-        --ttl)    TTL="$2"; shift 2 ;;
+        --prefix) PREFIX="${2:?--prefix needs a directory}"; shift 2 ;;
+        --dir)    WATCHDIR="${2:?--dir needs a directory}"; shift 2 ;;
+        --ttl)    TTL="${2:?--ttl needs a number of seconds}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "install.sh: unknown option '$1'" >&2; usage >&2; exit 1 ;;
     esac

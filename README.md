@@ -95,6 +95,10 @@ Global flags: `--dir <path>` (watch folder, default `~/Temp`), `--ttl <seconds>`
 (default `3600`), `--verbose` (log every cycle), `--no-trash` (delete
 permanently instead of using the Trash).
 
+`pseudocopy clip a.txt b.txt` puts several files on the pasteboard at once:
+a paste into the Finder copies all of them, a paste into a text field
+inserts the first one — a pasteboard holds a single value per type.
+
 Exit codes: `0` on success, `1` on a runtime error (the reason is written to
 stderr). Without a subcommand nothing happens — `pseudocopy` prints the usage
 instead of quietly starting a cycle.
@@ -119,6 +123,16 @@ Ignored entirely: directories, symlinks, dotfiles and partial downloads
 (`.crdownload`, `.part`, `.download`, `.tmp`, `.partial`). A partial download
 is never copied and never reaped; remove it by hand when it is stale.
 
+### The first minute
+
+When pseudocopy starts for the first time it cannot know which files are
+new. Files that are already in the folder and older than the TTL are
+therefore left alone — they are leftovers, not downloads — while a file that
+appears afterwards is copied as usual. If the state file is ever damaged the
+same rule applies: the folder is not emptied onto the clipboard all at once,
+and the damaged file is kept next to the state store as `state.json.corrupt`
+for diagnosis.
+
 ## Log
 
 The agent writes to `~/Library/Logs/pseudocopy.log`. Nothing is logged while
@@ -141,10 +155,13 @@ Add `--verbose` for a line per cycle (handy while developing with
   embedded data as well, but only up to 64 MB; above that, pasting after the
   file was reaped may fail, because the file-object reference needs the
   source to still exist.
+- Text files are only pasted as text up to 16 MB — bigger ones are offered
+  as a file reference instead, because the bytes would cost about three
+  times their size in memory. Images and PDFs are not materialised above
+  256 MB.
 - Very large files are best kept out of this folder: everything is copied
   into the clipboard, which lives in RAM. Nothing breaks, it is just
-  wasteful. Images and PDFs are not copied when they are larger than
-  256 MB.
+  wasteful.
 - **Manual edits in `~/Temp` are silently deleted after an hour.**
 - Stale partial downloads (`.crdownload` and friends) are ignored by
   `pseudocopy` — they are never copied and never reaped. Remove them by
