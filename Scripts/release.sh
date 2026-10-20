@@ -27,10 +27,15 @@ gh auth status >/dev/null 2>&1 || fail "gh is not authenticated"
 echo "==> pseudocopy ${VERSION}"
 
 echo "==> building arm64"
-swift build -c release
+swift build -c release --arch arm64
 
 echo "==> building x86_64 (takes a minute)"
 swift build -c release --arch x86_64
+
+ARM_BINARY=".build/arm64-apple-macosx/release/pseudocopy"
+X86_BINARY=".build/x86_64-apple-macosx/release/pseudocopy"
+[[ -f "${ARM_BINARY}" ]] || fail "missing ${ARM_BINARY}"
+[[ -f "${X86_BINARY}" ]] || fail "missing ${X86_BINARY}"
 
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/pseudocopy-release.XXXXXX")"
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/pseudocopy-release-tests.XXXXXX")"
@@ -38,8 +43,8 @@ trap 'rm -rf "${STAGE}" "${SANDBOX}"' EXIT
 
 cp README.md LICENSE "${STAGE}/"
 lipo -create \
-    ".build/release/pseudocopy" \
-    ".build/x86_64-apple-macosx/release/pseudocopy" \
+    "${ARM_BINARY}" \
+    "${X86_BINARY}" \
     -output "${STAGE}/pseudocopy"
 
 # lipo invalidates the linker's ad-hoc signature; sign the fat binary again.
