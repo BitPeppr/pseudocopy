@@ -82,6 +82,10 @@ func executablePath() -> String {
 
 /// The LaunchAgent plist (§5.2). All placeholders are absolute paths —
 /// launchd does not expand `~`.
+///
+/// `ThrottleInterval` is needed because launchd otherwise applies its
+/// default throttle of 10 seconds, which would stretch `StartInterval` of
+/// 5 seconds to an effective 10 second cycle.
 func launchAgentPlist(binaryPath: String, watchDir: String, ttl: TimeInterval, home: String) -> String {
     return """
     <?xml version="1.0" encoding="UTF-8"?>
@@ -98,6 +102,7 @@ func launchAgentPlist(binaryPath: String, watchDir: String, ttl: TimeInterval, h
       </array>
       <key>RunAtLoad</key><true/>
       <key>StartInterval</key><integer>\(Int(Constants.cycleInterval))</integer>
+      <key>ThrottleInterval</key><integer>\(Int(Constants.cycleInterval))</integer>
       <key>ProcessType</key><string>Interactive</string>
       <key>StandardOutPath</key><string>\(home)/Library/Logs/pseudocopy.log</string>
       <key>StandardErrorPath</key><string>\(home)/Library/Logs/pseudocopy.log</string>

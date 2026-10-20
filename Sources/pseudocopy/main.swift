@@ -71,6 +71,8 @@ enum CLI {
         var interval: TimeInterval? = nil
         var verbose = false
         var permanent = false
+        /// The global flags, handed over to `Configuration.parse`.
+        var globalFlags: [String] = []
 
         var index = 0
         while index < args.count {
@@ -86,9 +88,13 @@ enum CLI {
 
             switch arg {
             case "--dir":
-                watchDir = try value(for: "--dir")
+                let path = try value(for: "--dir")
+                watchDir = path
+                globalFlags.append(contentsOf: ["--dir", path])
             case "--ttl":
-                ttl = try Configuration.parseTTL(try value(for: "--ttl"))
+                let raw = try value(for: "--ttl")
+                ttl = try Configuration.parseTTL(raw)
+                globalFlags.append(contentsOf: ["--ttl", raw])
             case "--interval":
                 guard let raw = TimeInterval(try value(for: "--interval")), raw > 0 else {
                     throw CLIError.usage("invalid --interval value (expected a positive number of seconds)")
@@ -96,16 +102,20 @@ enum CLI {
                 interval = raw
             case "--verbose":
                 verbose = true
+                globalFlags.append(arg)
             case "--no-trash":
                 permanent = true
+                globalFlags.append(arg)
             case "-h", "--help":
                 command = .help
             default:
                 if arg.hasPrefix("--") {
                     if let value = argValue(arg, prefix: "--dir=") {
                         watchDir = value
+                        globalFlags.append(contentsOf: ["--dir", value])
                     } else if let value = argValue(arg, prefix: "--ttl=") {
                         ttl = try Configuration.parseTTL(value)
+                        globalFlags.append(contentsOf: ["--ttl", value])
                     } else if let value = argValue(arg, prefix: "--interval=") {
                         guard let raw = TimeInterval(value), raw > 0 else {
                             throw CLIError.usage("invalid --interval value (expected a positive number of seconds)")
@@ -127,7 +137,7 @@ enum CLI {
             index += 1
         }
 
-        var config = try Configuration.parse(args)
+        var config = try Configuration.parse(globalFlags)
         if let watchDir = watchDir {
             config.watchDir = Configuration.resolvePath(watchDir)
         }
