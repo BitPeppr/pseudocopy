@@ -362,13 +362,17 @@ private func performCycle(config: Configuration, clipping: Bool) throws {
     }
 
     // --- prune + save ----------------------------------------------------
+    // Records of files that no longer exist are dropped (§2.3).
     var missing = Set<String>()
     for path in records.keys where !FileManager.default.fileExists(atPath: path) {
         missing.insert(path)
     }
-    store.prune(missing: missing)
+    for path in missing {
+        records.removeValue(forKey: path)
+    }
     store.setRecords(records)
     store.setLastScan(scan)
+    store.prune(missing: missing)
     do {
         try store.save()
     } catch {

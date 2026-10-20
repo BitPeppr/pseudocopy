@@ -111,6 +111,11 @@ if [[ -f "${SANDBOX}/sample.still-downloading.crdownload" ]]; then
 else
     fail "the partial download is left alone"
 fi
+if [[ -f "${STATE_FILE}" ]] && grep -q "sample.txt" "${STATE_FILE}"; then
+    fail "the state record of the reaped file is pruned"
+else
+    pass "the state record of the reaped file is pruned"
+fi
 
 # --- state store -----------------------------------------------------------
 echo "==> state store"
