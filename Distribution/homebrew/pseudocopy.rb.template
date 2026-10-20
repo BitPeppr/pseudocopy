@@ -30,10 +30,9 @@ class Pseudocopy < Formula
       older than an hour to the Trash. Do not also run `pseudocopy install`:
       that would register a second agent.
 
-      The service watches ~/Temp. To watch another folder (or change the TTL),
-      remove the service and install the agent from source instead:
+      This service watches ~/Temp. To watch another folder, stop it and
+      install the agent from a source checkout instead (see the README):
         brew services stop pseudocopy
-        pseudocopy install --dir ~/Downloads --ttl 600
     EOS
   end
 

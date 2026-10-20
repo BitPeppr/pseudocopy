@@ -1,5 +1,7 @@
 # pseudocopy
 
+[![CI](https://github.com/BitPeppr/pseudocopy/actions/workflows/ci.yml/badge.svg)](https://github.com/BitPeppr/pseudocopy/actions/workflows/ci.yml)
+
 A tiny native-macOS helper that watches **one folder** (by default `~/Temp`),
 copies every new, finished file to the **clipboard** — smart about its type —
 and moves files that are older than an hour to the **Trash**.
