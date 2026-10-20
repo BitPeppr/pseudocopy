@@ -38,7 +38,7 @@ class Pseudocopy < Formula
 
   test do
     system bin/"pseudocopy", "gen-tests", testpath
-    assert_predicate testpath/"sample.txt", :exist?
+    assert_path_exists testpath/"sample.txt"
     assert_match "pseudocopy #{version}", shell_output("#{bin}/pseudocopy version")
   end
 end
