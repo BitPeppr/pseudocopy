@@ -23,7 +23,7 @@ struct Pseudocopy {
         case .run:
             try runCycle(config: invocation.config)
         case .loop:
-            try runLoop(config: invocation.config, interval: invocation.interval)
+            try runLoop(config: invocation.config, interval: invocation.config.interval)
         case .clean:
             try runClean(config: invocation.config)
         case .clip:
@@ -35,7 +35,9 @@ struct Pseudocopy {
         case .uninstall:
             try uninstallAgent()
         case .status:
-            try printAgentStatus()
+            try printAgentStatus(config: invocation.config)
+        case .config:
+            try runConfigCommand(invocation.positional, config: invocation.config)
         case .kick:
             try kickAgent()
         case .version:
@@ -49,7 +51,6 @@ struct Invocation {
     var command: Command
     var config: Configuration
     var positional: [String]
-    var interval: TimeInterval
 }
 
 /// Supported subcommands (§2.7).
@@ -62,22 +63,25 @@ enum Command: String {
     case install
     case uninstall
     case status
+    case config
     case kick
     case version
     case help
 }
+
+/// The global flags that take a value. Every one of them can also be stored
+/// in the settings file; the command line always wins.
+private let globalFlagsWithValue: [String] = [
+    "--dir", "--ttl", "--interval", "--log", "--state-dir",
+    "--text-limit", "--embed-limit", "--materialise-limit",
+]
 
 /// Command line parsing (§2.7).
 enum CLI {
     static func parse(_ args: [String]) throws -> Invocation {
         var command: Command? = nil
         var positional: [String] = []
-        var watchDir: String? = nil
-        var ttl: TimeInterval? = nil
-        var interval: TimeInterval? = nil
-        var verbose = false
-        var permanent = false
-        /// The global flags, handed over to `Configuration.parse`.
+        /// The global flags, handed over to `Configuration`.
         var globalFlags: [String] = []
 
         var index = 0
@@ -93,31 +97,15 @@ enum CLI {
 
             func value(for flag: String) throws -> String {
                 index += 1
-                guard index < args.count else {
-                    throw CLIError.usage("missing value for \(flag)")
-                }
+                guard index < args.count else { throw CLIError.usage("missing value for \(flag)") }
                 return args[index]
             }
 
             switch arg {
-            case "--dir":
-                let path = try value(for: "--dir")
-                watchDir = path
-                globalFlags.append(contentsOf: ["--dir", path])
-            case "--ttl":
-                let raw = try value(for: "--ttl")
-                ttl = try Configuration.parseTTL(raw)
-                globalFlags.append(contentsOf: ["--ttl", raw])
-            case "--interval":
-                guard let raw = parseInterval(try value(for: "--interval")) else {
-                    throw CLIError.usage("invalid --interval value (expected a positive number of seconds)")
-                }
-                interval = raw
-            case "--verbose":
-                verbose = true
-                globalFlags.append(arg)
-            case "--no-trash":
-                permanent = true
+            case "--dir", "--ttl", "--interval", "--log", "--state-dir",
+                 "--text-limit", "--embed-limit", "--materialise-limit":
+                globalFlags.append(contentsOf: [arg, try value(for: arg)])
+            case "--verbose", "--no-trash":
                 globalFlags.append(arg)
             case "-h", "--help":
                 command = .help
@@ -125,22 +113,20 @@ enum CLI {
                 command = .version
             default:
                 if arg.hasPrefix("--") {
-                    if let value = argValue(arg, prefix: "--dir=") {
-                        watchDir = value
-                        globalFlags.append(contentsOf: ["--dir", value])
-                    } else if let value = argValue(arg, prefix: "--ttl=") {
-                        ttl = try Configuration.parseTTL(value)
-                        globalFlags.append(contentsOf: ["--ttl", value])
-                    } else if let value = argValue(arg, prefix: "--interval=") {
-                        guard let raw = parseInterval(value) else {
-                            throw CLIError.usage("invalid --interval value (expected a positive number of seconds)")
-                        }
-                        interval = raw
+                    // The `--flag=value` form is normalised to two arguments.
+                    if let (flag, value) = splitAssignment(arg),
+                       globalFlagsWithValue.contains(flag) {
+                        globalFlags.append(contentsOf: [flag, value])
                     } else {
                         throw CLIError.usage("unknown option '\(arg)'")
                     }
                 } else if arg.hasPrefix("-") {
-                    throw CLIError.usage("unknown option '\(arg)'")
+                    // A negative number is a value, not an option.
+                    if Double(arg.dropFirst()) != nil, command != nil {
+                        positional.append(arg)
+                    } else {
+                        throw CLIError.usage("unknown option '\(arg)'")
+                    }
                 } else if command == nil, let parsed = Command(rawValue: arg) {
                     command = parsed
                 } else if command == nil {
@@ -152,36 +138,29 @@ enum CLI {
             index += 1
         }
 
-        var config = try Configuration.parse(globalFlags)
-        if let watchDir = watchDir {
-            config.watchDir = try Configuration.resolvePath(watchDir)
-        }
-        if let ttl = ttl {
-            config.ttl = ttl
-        }
-        config.verbose = verbose || config.verbose
-        config.permanent = permanent || config.permanent
+        // The `config` command has to work even when the stored settings are
+        // broken — otherwise the user could not repair them.
+        let config = try Configuration.resolve(
+            settings: SettingsStore.load(),
+            arguments: globalFlags,
+            validate: command != .config
+        )
 
         return Invocation(
             // Without a subcommand nothing happens — a bare `pseudocopy` must
             // not silently start a real cycle against ~/Temp.
             command: command ?? .help,
             config: config,
-            positional: positional,
-            interval: interval ?? Constants.cycleInterval
+            positional: positional
         )
     }
 
-    private static func argValue(_ arg: String, prefix: String) -> String? {
-        guard arg.hasPrefix(prefix) else { return nil }
-        return String(arg.dropFirst(prefix.count))
-    }
-
-    /// Parses a cycle interval. `inf` and other absurd values are rejected
-    /// instead of trapping later on.
-    static func parseInterval(_ raw: String) -> TimeInterval? {
-        guard let value = TimeInterval(raw), value.isFinite, value > 0, value <= 86_400 else { return nil }
-        return value
+    /// Splits `--flag=value` into its two parts.
+    private static func splitAssignment(_ arg: String) -> (String, String)? {
+        guard let separator = arg.firstIndex(of: "=") else { return nil }
+        let flag = String(arg[arg.startIndex..<separator])
+        let value = String(arg[arg.index(after: separator)...])
+        return (flag, value)
     }
 
     static func printUsage() {
@@ -194,21 +173,35 @@ enum CLI {
           pseudocopy clean [--no-trash]  # force-reap now; bypasses the settle rule
           pseudocopy clip <path...>      # clip a file manually, bypassing settle logic
           pseudocopy gen-tests <dir>     # write sample files for testing
-          pseudocopy install             # write LaunchAgent plist + launchctl bootstrap
-          pseudocopy uninstall           # launchctl bootout + remove plist
-          pseudocopy status              # exit 0 if agent is loaded, 1 otherwise
+          pseudocopy install             # write the LaunchAgent plist + launchctl bootstrap
+          pseudocopy uninstall           # launchctl bootout + remove the plist
+          pseudocopy status              # exit 0 if the agent is loaded, 1 otherwise
+          pseudocopy config [action]     # read and change the settings file
           pseudocopy kick                # force one cycle of the agent right now
           pseudocopy version             # print the version
           pseudocopy help                # usage
 
-        GLOBAL FLAGS:
-          --dir <path>      watch dir (default ~/Temp); refuses /, your home
-                            folder, /Volumes and shared temp roots
-          --ttl <seconds>   reaper time-to-live (default 3600)
-          --verbose         log every cycle, not just events
-          --no-trash        delete permanently instead of moving to the Trash
-                            (`install` freezes this into the agent)
-          --interval <secs> cycle interval for `loop` (default 5)
+        GLOBAL FLAGS (they win over the settings file):
+          --dir <path>           watch dir (default ~/Temp); refuses /, your home
+                                 folder, other users' homes, /Volumes, shared roots
+          --ttl <seconds>        reaper time-to-live (default 3600)
+          --interval <seconds>   how often the folder is checked (default 5)
+          --log <path>           where the agent writes its log
+          --state-dir <path>     where the state store lives
+          --text-limit <bytes>   largest text file that is embedded as text
+          --embed-limit <bytes>  largest generic file whose bytes are embedded
+          --materialise-limit <bytes>  largest image or PDF that is materialised
+          --verbose              log every cycle, not just events
+          --no-trash             delete permanently instead of moving to the Trash
+
+        SETTINGS FILE:
+          ~/.Library/Application Support/pseudocopy/config.json
+          pseudocopy config list        show every setting and where it comes from
+          pseudocopy config get <key>   print one effective value
+          pseudocopy config set <key> <value>   change one setting
+          pseudocopy config unset <key> back to the default
+          pseudocopy config reset       remove the file
+          pseudocopy config path        print the file's path
 
         NOTES:
           Files already in the folder when it is first seen (or after the state

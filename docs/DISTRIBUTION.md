@@ -26,6 +26,12 @@ should be shipped.
   matching the plist written by the built-in `pseudocopy install` (only the
   launchd label differs, because Homebrew owns it): one short-lived cycle
   every five seconds, no resident daemon.
+- **One configuration for both.** The formula reads the settings file
+  (`~/Library/Application Support/pseudocopy/config.json`) when it writes the
+  plist, so the check interval and the log path in the plist match what
+  `pseudocopy config` says. The agent itself reads the same file on every
+  cycle, so a setting changed on the command line takes effect without
+  reinstalling the service.
 
 ## Why not a DMG
 

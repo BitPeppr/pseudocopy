@@ -46,23 +46,12 @@ struct StateStore {
     /// How long a watch folder may be gone before its history is dropped.
     private static let namespaceGrace: TimeInterval = 24 * 3600
 
-    init(watchDir: URL) {
+    /// - Parameter root: where `state.json` and the lock live. The caller
+    ///   decides — the settings file can move the store somewhere else.
+    init(watchDir: URL, root: URL? = nil) {
         self.watchDir = watchDir
         self.namespaceKey = canonicalPath(watchDir)
-
-        // The smoke test points the store at a private directory so it cannot
-        // touch the live state. Foundation ignores a redirected $HOME for the
-        // application-support lookup, so this small override is the only way
-        // to make the tests hermetic.
-        if let override = ProcessInfo.processInfo.environment["PSEUDOCOPY_STATE_ROOT"],
-           !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let expanded = (override as NSString).expandingTildeInPath
-            self.root = URL(fileURLWithPath: expanded).standardizedFileURL
-        } else {
-            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-                ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-            self.root = appSupport.appendingPathComponent(Constants.appSupportFolder, isDirectory: true)
-        }
+        self.root = root ?? SettingsStore.defaultRootDirectory
         self.file = StateFile()
     }
 

@@ -4,7 +4,7 @@ import Foundation
 enum Constants {
     /// The released version. `Scripts/release.sh` reads this value and
     /// refuses to publish a tag that does not match it.
-    static let version = "1.0.2"
+    static let version = "1.0.3"
 
     /// Seconds between cycles when running in resident `loop` mode.
     /// The LaunchAgent uses the same value as its `StartInterval`.
@@ -20,6 +20,21 @@ enum Constants {
 
     /// Maximum size of a file whose raw bytes get embedded in the pasteboard.
     static let embedLimitBytes: Int = 64 << 20
+
+    /// Maximum size of a text file that is embedded as text. Text costs about
+    /// three times its size in memory (the bytes, the decoded string and the
+    /// pasteboard's own copy), so the limit is much lower than for binary data.
+    static let textLimitBytes: Int = 16 << 20
+
+    /// Maximum size of an image or PDF that is materialised. Such a file is
+    /// copied into the pasteboard byte for byte, so there has to be a limit —
+    /// a multi gigabyte "PDF" would otherwise take the process down with it.
+    static let materialiseLimitBytes: Int = 256 << 20
+
+    /// Hard ceiling for the configurable size limits. The limits exist to keep
+    /// the pasteboard (and the machine) alive; a setting may lower them, but
+    /// not remove them.
+    static let byteLimitCeiling: Int = 4 << 30
 
     /// LaunchAgent label.
     static let agentLabel = "com.pseudocopy"
@@ -38,6 +53,9 @@ enum Constants {
 
     /// State file name inside the app-support folder.
     static let stateFileName = "state.json"
+
+    /// Settings file name inside the app-support folder.
+    static let settingsFileName = "config.json"
 
     /// Lock file name inside the app-support folder.
     static let lockFileName = "lock"

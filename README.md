@@ -27,13 +27,19 @@ brew services start pseudocopy
 ```
 
 The formula installs the universal binary and a LaunchAgent that runs
-`pseudocopy run` every five seconds. It watches `~/Temp`. To watch another
-folder or use a different TTL, stop the service and run the built-in
-installer (`brew services stop pseudocopy; pseudocopy install --dir <path>`),
-or use the source install below. Do **not** run `pseudocopy install` while
-the Homebrew service is loaded — it refuses. `pseudocopy status` and
-`pseudocopy kick` work with the Homebrew service; use `brew services` to
-start, stop, or restart it.
+`pseudocopy run` every five seconds. It watches `~/Temp` by default — every
+setting is configurable with `pseudocopy config` (see
+[Configuration](#configuration)). To watch another folder, change the setting
+instead of installing a second agent:
+
+```sh
+pseudocopy config set dir ~/Downloads
+brew services restart pseudocopy
+```
+
+Do **not** run `pseudocopy install` while the Homebrew service is loaded — it
+refuses. `pseudocopy status` and `pseudocopy kick` work with the Homebrew
+service; use `brew services` to start, stop, or restart it.
 
 ### From source
 
@@ -52,6 +58,7 @@ Options:
 Scripts/install.sh --prefix ~/bin      # where the binary goes (default ~/bin)
 Scripts/install.sh --dir ~/Downloads   # the folder to watch (default ~/Temp)
 Scripts/install.sh --ttl 600           # reap after 10 minutes (default 3600)
+Scripts/install.sh --interval 10       # check every 10 seconds (default 5)
 ```
 
 You can also install by hand:
@@ -62,10 +69,9 @@ mkdir -p ~/bin && cp .build/release/pseudocopy ~/bin/
 ~/bin/pseudocopy install --dir ~/Temp
 ```
 
-The TTL, the watch folder and the deletion mode are written into the agent's
-plist when it is installed, so changing any of them later means re-running
-`pseudocopy install`. The agent always watches the directory it was installed
-with.
+The flags are written into the settings file, not into the agent's plist, so
+changing a setting later means `pseudocopy config set …` — not another
+install.
 
 ## Uninstall
 
@@ -114,15 +120,69 @@ pseudocopy gen-tests <dir>     # write sample files for testing
 pseudocopy install             # write the LaunchAgent plist + launchctl bootstrap
 pseudocopy uninstall           # launchctl bootout + remove the plist
 pseudocopy status              # exit 0 if the agent is loaded, 1 otherwise
+pseudocopy config [action]     # read and change the settings file
 pseudocopy kick                # force one cycle of the agent right now
 pseudocopy version             # print the version
 pseudocopy help                # usage
 ```
 
 Global flags: `--dir <path>` (watch folder, default `~/Temp`), `--ttl <seconds>`
-(default `3600`), `--verbose` (log every cycle), `--no-trash` (delete
-permanently instead of using the Trash; `install` freezes this into the
-agent).
+(default `3600`), `--interval <seconds>` (check interval, default `5`),
+`--verbose` (log every cycle), `--no-trash` (delete permanently instead of
+using the Trash), `--log <path>`, `--state-dir <path>`, `--text-limit`,
+`--embed-limit`, `--materialise-limit`.
+
+## Configuration
+
+Every setting lives in one file:
+
+```
+~/Library/Application Support/pseudocopy/config.json
+```
+
+The command line always wins over the file, so a single cycle can run with
+different settings without changing anything permanent.
+
+```sh
+pseudocopy config list                  # every setting, its value and where it came from
+pseudocopy config get ttl               # one effective value
+pseudocopy config set ttl 600           # change one setting
+pseudocopy config set dir ~/Downloads
+pseudocopy config set interval 10
+pseudocopy config set permanent true    # delete instead of using the Trash
+pseudocopy config unset ttl             # back to the default
+pseudocopy config reset                 # remove the file
+pseudocopy config path                  # where the file is
+```
+
+| Setting | Flag | Default | Meaning |
+|---|---|---|---|
+| `dir` | `--dir` | `~/Temp` | the folder that is watched |
+| `ttl` | `--ttl` | `3600` | how long a file may stay before it is reaped (seconds) |
+| `interval` | `--interval` | `5` | how often the folder is checked (seconds) |
+| `permanent` | `--no-trash` | `false` | delete files permanently instead of using the Trash |
+| `verbose` | `--verbose` | `false` | log every cycle, not just events |
+| `log-path` | `--log` | `~/Library/Logs/pseudocopy.log` | where the agent writes its log |
+| `state-dir` | `--state-dir` | `~/Library/Application Support/pseudocopy` | where the state store lives |
+| `text-limit` | `--text-limit` | `16MB` | largest text file that is embedded as text |
+| `embed-limit` | `--embed-limit` | `64MB` | largest generic file whose bytes are embedded |
+| `materialise-limit` | `--materialise-limit` | `256MB` | largest image or PDF that is materialised |
+
+The agent reads the file on every cycle, so **changing a setting takes effect
+immediately — no reinstall**. Two values live in the agent's plist instead of
+in the file, because launchd itself needs them: the check interval and the log
+path. After changing those, re-run `pseudocopy install` (or
+`brew services restart pseudocopy`).
+
+`pseudocopy install` writes the flags it was given into the settings file, so
+installing with `pseudocopy install --ttl 600` stores `ttl: 600` and leaves
+every other setting alone. The installed plist itself stays minimal
+(`pseudocopy run`), which is why `brew upgrade` can never break it.
+
+The Homebrew service reads the same file: `brew services start` copies the
+check interval and the log path from it into the plist, and the agent reads
+everything else itself. The watch-folder guard applies to the file too — a
+hand-edited `dir` cannot point the reaper at your home directory.
 
 `pseudocopy clip a.txt b.txt` puts several files on the pasteboard at once:
 a paste into the Finder copies all of them, a paste into a text field
@@ -263,8 +323,12 @@ git history.
   only when something actually changed; the per-folder "seen" timestamp is
   refreshed hourly rather than every cycle, so an idle agent does not rewrite
   it.
-- `PSEUDOCOPY_STATE_ROOT` points the store at another directory. It exists for
-  the smoke test; normal use does not need it.
+- The settings live next to it in
+  `~/Library/Application Support/pseudocopy/config.json` (mode 0600). The
+  agent reads it on every cycle, so a change takes effect without a restart.
+- `PSEUDOCOPY_STATE_ROOT` points both the store and the settings file at
+  another directory. It exists for the smoke test; normal use does not need
+  it.
 - Cycles are serialised with an `flock` on `…/pseudocopy/lock`. The kernel
   releases it when the process dies, so a lock left behind by a killed cycle
   can never wedge the tool. The file contains the PID for diagnostics.

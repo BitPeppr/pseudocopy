@@ -156,30 +156,28 @@ private func executableCandidates() -> [String] {
 /// The LaunchAgent plist (§5.2). All placeholders are absolute paths —
 /// launchd does not expand `~`.
 ///
+/// The agent is started without any settings flags: everything comes from the
+/// settings file, so changing a setting does not require a reinstall. The
+/// plist only carries what launchd itself has to know — the binary, the
+/// interval and the log file.
+///
 /// `ThrottleInterval` is needed because launchd otherwise applies its
-/// default throttle of 10 seconds, which would stretch `StartInterval` of
+/// default throttle of 10 seconds, which would stretch a `StartInterval` of
 /// 5 seconds to an effective 10 second cycle.
 ///
 /// The plist is serialised by Foundation instead of being written by hand,
 /// so that paths containing `&` or `<` cannot produce an invalid file.
-func launchAgentPlist(binaryPath: String, watchDir: String, ttl: TimeInterval, home: String,
-                      permanent: Bool) throws -> Data {
-    var arguments = [binaryPath, "run", "--dir", watchDir, "--ttl", String(ttl)]
-    if permanent {
-        // Freeze the deletion mode into the agent: `brew services` has no
-        // flags of its own, and a later `pseudocopy install --no-trash`
-        // must not silently lose the setting.
-        arguments.append("--no-trash")
-    }
+func launchAgentPlist(binaryPath: String, interval: TimeInterval, logPath: String) throws -> Data {
+    let seconds = max(1, Int(interval.rounded()))
     let plist: [String: Any] = [
         "Label": Constants.agentLabel,
-        "ProgramArguments": arguments,
+        "ProgramArguments": [binaryPath, "run"],
         "RunAtLoad": true,
-        "StartInterval": Int(Constants.cycleInterval),
-        "ThrottleInterval": Int(Constants.cycleInterval),
+        "StartInterval": seconds,
+        "ThrottleInterval": seconds,
         "ProcessType": "Interactive",
-        "StandardOutPath": "\(home)/Library/Logs/pseudocopy.log",
-        "StandardErrorPath": "\(home)/Library/Logs/pseudocopy.log",
+        "StandardOutPath": logPath,
+        "StandardErrorPath": logPath,
     ]
     return try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
 }
@@ -212,16 +210,45 @@ func installAgent(config: Configuration) throws {
     }
 
     // The watch directory has to exist before the agent starts.
+    let watchDirExisted = fileManager.fileExists(atPath: config.watchDir.path)
     try fileManager.createDirectory(at: config.watchDir, withIntermediateDirectories: true,
                                     attributes: [.posixPermissions: 0o700])
     try fileManager.createDirectory(at: AgentPaths.launchAgentsDirectory, withIntermediateDirectories: true)
-    try fileManager.createDirectory(at: AgentPaths.logsDirectory, withIntermediateDirectories: true)
+
     // The log lists the names of the files that were copied — keep it
     // readable by the user only.
-    if !fileManager.fileExists(atPath: AgentPaths.logURL.path) {
-        fileManager.createFile(atPath: AgentPaths.logURL.path, contents: nil)
+    let logDirectory = config.logPath.deletingLastPathComponent()
+    try fileManager.createDirectory(at: logDirectory, withIntermediateDirectories: true)
+    if !fileManager.fileExists(atPath: config.logPath.path) {
+        fileManager.createFile(atPath: config.logPath.path, contents: nil)
     }
-    try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: AgentPaths.logURL.path)
+    try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: config.logPath.path)
+
+    // The state store has to exist too; it holds the settle bookkeeping.
+    let stateDirExisted = fileManager.fileExists(atPath: config.stateDir.path)
+    try fileManager.createDirectory(at: config.stateDir, withIntermediateDirectories: true,
+                                    attributes: [.posixPermissions: 0o700])
+
+    // Everything the user asked for on the command line becomes the stored
+    // configuration. The rest of the settings file is left alone.
+    let settings = SettingsStore.load()
+    var updated = settings
+    updated.version = 1
+    if let dir = config.explicit.dir { updated.dir = dir }
+    if let ttl = config.explicit.ttl { updated.ttl = ttl }
+    if let interval = config.explicit.interval { updated.interval = interval }
+    if let permanent = config.explicit.permanent { updated.permanent = permanent }
+    if let verbose = config.explicit.verbose { updated.verbose = verbose }
+    if let logPath = config.explicit.logPath { updated.logPath = logPath }
+    if let stateDir = config.explicit.stateDir { updated.stateDir = stateDir }
+    if let limit = config.explicit.textLimit { updated.textLimit = limit }
+    if let limit = config.explicit.embedLimit { updated.embedLimit = limit }
+    if let limit = config.explicit.materialiseLimit { updated.materialiseLimit = limit }
+    // An install without any flags must not leave an empty settings file
+    // behind — but it may refresh an existing one.
+    if !config.explicit.isEmpty || !updated.isEmpty {
+        try SettingsStore.save(updated)
+    }
 
     // Existing content is not copied retroactively, and anything older than
     // the TTL will be reaped. Say so before arming the agent.
@@ -233,13 +260,19 @@ func installAgent(config: Configuration) throws {
               + "files older than \(Int(config.ttl))s will be moved to the Trash")
     }
 
+    printWarnings(config: config)
+    if !watchDirExisted {
+        print("warning: \(config.watchDir.path) did not exist and was created")
+    }
+    if !stateDirExisted {
+        print("warning: the state store \(config.stateDir.path) did not exist and was created")
+    }
+
     let binary = executablePath()
     let plist = try launchAgentPlist(
         binaryPath: binary,
-        watchDir: config.watchDir.path,
-        ttl: config.ttl,
-        home: NSHomeDirectory(),
-        permanent: config.permanent
+        interval: config.interval,
+        logPath: config.logPath.path
     )
     let previousPlist = try? Data(contentsOf: AgentPaths.plistURL)
     try plist.write(to: AgentPaths.plistURL, options: [.atomic])
@@ -263,10 +296,75 @@ func installAgent(config: Configuration) throws {
     print("installed \(Constants.agentLabel)")
     print("  watch dir : \(config.watchDir.path)")
     print("  ttl       : \(Int(config.ttl))s")
+    print("  interval  : \(Int(config.interval))s")
     print("  deletion  : \(config.permanent ? "permanent" : "Trash")")
     print("  binary    : \(binary)")
     print("  plist     : \(AgentPaths.plistURL.path)")
-    print("  log       : \(AgentPaths.logURL.path)")
+    print("  log       : \(config.logPath.path)")
+    print("  settings  : \(SettingsStore.fileURL.path)")
+}
+
+/// Prints everything that is worth knowing before the agent starts watching
+/// a folder.
+func printWarnings(config: Configuration) {
+    let home = URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path
+
+    // Personal folders are allowed, but everything in them is subject to the
+    // reaper — the user should know that.
+    let personal = [home + "/Downloads", home + "/Desktop", home + "/Documents"]
+    if personal.contains(config.watchDir.path) {
+        print("warning: \(config.watchDir.path) is a personal folder — every file in its top level "
+              + "is subject to the \(Int(config.ttl))s reaper")
+    }
+    if config.watchDir.path.hasPrefix("/Volumes/") {
+        print("warning: \(config.watchDir.path) is on an external volume — cycles are skipped while it is not mounted")
+    }
+    if config.ttl == 0 {
+        print("warning: the TTL is 0 — every file is reaped on the next cycle")
+    }
+    if config.ttl < config.interval * 2 {
+        print("warning: the TTL (\(Int(config.ttl))s) is shorter than two cycles (\(Int(config.interval * 2))s) — "
+              + "files can be reaped before they were ever copied")
+    }
+    if config.interval < 2 {
+        print("warning: the interval is \(config.interval)s — the agent wakes up very often and uses more energy")
+    }
+    if config.interval > 60 {
+        print("warning: the interval is \(Int(config.interval))s — a new file can take that long to be copied")
+    }
+    if config.permanent {
+        print("warning: files are deleted permanently — the Trash cannot bring them back")
+    }
+    if config.verbose {
+        print("warning: verbose logging writes one line per cycle — the log grows quickly")
+    }
+    if config.logPath.path.hasPrefix(home + "/Library/Logs/") == false {
+        print("warning: the log is written to \(config.logPath.path) — outside ~/Library/Logs it may be backed up or synced")
+    }
+    if config.textLimitBytes > Constants.textLimitBytes
+        || config.embedLimitBytes > Constants.embedLimitBytes
+        || config.materialiseLimitBytes > Constants.materialiseLimitBytes {
+        print("warning: the pasteboard size limits are raised above the defaults — "
+              + "a file of that size is copied into memory (and the pasteboard)")
+    }
+    if config.stateDir.path == config.watchDir.path
+        || config.watchDir.path.hasPrefix(config.stateDir.path + "/") {
+        print("warning: the state store is inside the watched folder — its files would be reaped as well")
+    }
+    if ProcessInfo.processInfo.environment["PSEUDOCOPY_STATE_ROOT"] != nil {
+        print("warning: PSEUDOCOPY_STATE_ROOT is set — the settings and the state live in "
+              + "\(config.stateDir.path); the agent under launchd does not have that variable "
+              + "and would not see them")
+    }
+
+    // A Homebrew service that is not running but whose plist is still on disk
+    // would come back the next time the user runs 'brew services start' and
+    // put a second agent next to this one.
+    for name in Constants.homebrewAgentLabels {
+        let plist = AgentPaths.launchAgentsDirectory.appendingPathComponent("\(name).plist")
+        guard FileManager.default.fileExists(atPath: plist.path) else { continue }
+        print("warning: \(plist.path) still exists — 'brew services start pseudocopy' would load a second agent")
+    }
 }
 
 /// Removes the LaunchAgent and its plist (§5).
@@ -300,7 +398,8 @@ func uninstallAgent() throws {
         try FileManager.default.removeItem(at: AgentPaths.plistURL)
     }
     print("uninstalled \(Constants.agentLabel)")
-    print("  watch dir and state are kept")
+    print("  watch dir, state and settings are kept")
+    print("  'pseudocopy config reset' removes the settings file")
     if let agent = Launchctl.loadedAgents().first(where: { Launchctl.isHomebrew(label: $0.name) }) {
         print("  note: \(agent.name) is managed by Homebrew: brew services stop pseudocopy")
     }
@@ -321,7 +420,7 @@ func kickAgent() throws {
 }
 
 /// Prints the agent status; exits 1 when the agent is not loaded (§5.3).
-func printAgentStatus() throws {
+func printAgentStatus(config: Configuration) throws {
     let agents = Launchctl.loadedAgents()
     guard let agent = agents.first else {
         let names = ([Constants.agentLabel] + Constants.homebrewAgentLabels).joined(separator: ", ")
@@ -335,4 +434,13 @@ func printAgentStatus() throws {
         let others = agents.dropFirst().map { $0.name }.joined(separator: ", ")
         print("\nwarning: more than one agent is loaded — also \(others)")
     }
+
+    // The settings the agent actually works with.
+    print("\nsettings")
+    print("  watch dir : \(config.watchDir.path)")
+    print("  ttl       : \(Int(config.ttl))s")
+    print("  interval  : \(Int(config.interval))s")
+    print("  deletion  : \(config.permanent ? "permanent" : "Trash")")
+    print("  log       : \(config.logPath.path)")
+    print("  settings  : \(SettingsStore.fileURL.path)")
 }

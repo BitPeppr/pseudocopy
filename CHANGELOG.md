@@ -4,6 +4,73 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [semantic versioning](https://semver.org/).
 
+## [1.0.3] — 2026-10-20
+
+### Added
+
+- **Every setting is configurable from the command line.** The new
+  `pseudocopy config` subcommand reads and writes one settings file
+  (`~/Library/Application Support/pseudocopy/config.json`): `config list`,
+  `config get <key>`, `config set <key> <value>`, `config unset <key>`,
+  `config reset` and `config path`. `config list` shows every value and
+  where it came from (command line, settings file, default).
+- New settings, each with a matching flag: `dir`, `ttl`, `interval`,
+  `permanent`, `verbose`, `log-path`, `state-dir`, `text-limit`,
+  `embed-limit` and `materialise-limit`. The size limits accept plain byte
+  counts and `16MB`/`1GiB` style values.
+- `--interval` is now honoured by `install` (it used to be accepted and
+  ignored there) and by the `loop` command.
+- `--log` chooses where the agent writes its log, `--state-dir` where the
+  state store lives.
+- The Homebrew formula reads the settings file, so `brew services start`
+  copies the check interval and the log path from it into the plist. The
+  service and the command line can no longer disagree.
+- `Scripts/install.sh` learned `--interval` and `--no-trash`.
+
+### Changed
+
+- The agent's plist is now minimal (`pseudocopy run`): the settings live in
+  the settings file, which the agent reads on every cycle. **Changing a
+  setting takes effect immediately — no reinstall.** Only the check interval
+  and the log path stay in the plist, because launchd needs them; after
+  changing those, re-run `pseudocopy install` or `brew services restart`.
+- `pseudocopy install` stores the flags it was given in the settings file
+  and leaves every other setting alone. The watch folder and the state store
+  are still never touched by an install.
+- The command line always wins over the settings file, and
+  `PSEUDOCOPY_STATE_ROOT` still wins over the file for the state store.
+- The watch-folder guard also applies to values that come from the settings
+  file: a hand-edited `dir` cannot point the reaper at your home directory.
+
+### Warnings
+
+`install` and `config set` now say what could bite:
+
+- the watched folder already contains files, is a personal folder
+  (`~/Downloads`, `~/Desktop`, `~/Documents`) or lives on an external volume
+- the TTL is 0, or shorter than two cycles (files could be reaped before
+  they were ever copied)
+- the interval is very short (the agent wakes up often) or very long (a
+  download takes that long to appear)
+- files are deleted permanently, or the log grows one line per cycle
+- the log is written outside `~/Library/Logs`
+- the pasteboard size limits are above the defaults
+- the state store is inside the watched folder
+- a Homebrew service plist is still on disk — `brew services start` would
+  load a second agent
+- `PSEUDOCOPY_STATE_ROOT` is set, so the agent under launchd would not see
+  the settings
+
+### Fixed
+
+- A damaged settings file is kept as `config.json.corrupt` and the defaults
+  apply, instead of the tool refusing to run.
+- `pseudocopy config` works even when the stored settings are broken — it
+  must be possible to repair them.
+- Negative numbers are accepted as values (`pseudocopy config set ttl -1`
+  reports a proper error instead of "unknown option").
+- `pseudocopy status` now also prints the settings the agent works with.
+
 ## [1.0.2] — 2026-10-20
 
 ### Fixed

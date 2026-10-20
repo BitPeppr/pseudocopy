@@ -11,14 +11,29 @@ class Pseudocopy < Formula
     bin.install "pseudocopy"
   end
 
+  # The agent reads everything from its settings file, so the service and the
+  # command line always agree. Only the two values that launchd itself has to
+  # know — the check interval and the log file — are copied into the plist
+  # here, and they are read from the same file.
+  def self.pseudocopy_settings
+    root = ENV["PSEUDOCOPY_STATE_ROOT"] || "#{Dir.home}/Library/Application Support/pseudocopy"
+    file = File.join(root, "config.json")
+    return {} unless File.file?(file)
+
+    JSON.parse(File.read(file))
+  rescue
+    {}
+  end
+
+  settings = Pseudocopy.pseudocopy_settings
   service do
     run [opt_bin/"pseudocopy", "run"]
     run_type :interval
-    interval 5
-    throttle_interval 5
+    interval [1, (settings["interval"] || 5).to_i].max
+    throttle_interval [1, (settings["interval"] || 5).to_i].max
     process_type :interactive
-    log_path "#{Dir.home}/Library/Logs/pseudocopy.log"
-    error_log_path "#{Dir.home}/Library/Logs/pseudocopy.log"
+    log_path settings["logPath"] || "#{Dir.home}/Library/Logs/pseudocopy.log"
+    error_log_path settings["logPath"] || "#{Dir.home}/Library/Logs/pseudocopy.log"
   end
 
   def caveats
@@ -31,6 +46,16 @@ class Pseudocopy < Formula
       the service first starts are treated as leftovers and are not copied;
       files older than the TTL are still moved to the Trash. The log is at
       ~/Library/Logs/pseudocopy.log.
+
+      Everything is configurable from the command line:
+        pseudocopy config list           # show every setting
+        pseudocopy config set ttl 600    # keep files for ten minutes
+        pseudocopy config set dir ~/Downloads
+        pseudocopy config set interval 10
+      The settings live in ~/Library/Application Support/pseudocopy/config.json.
+      The agent picks them up on its next cycle; after changing the check
+      interval or the log path, run 'brew services restart pseudocopy' so the
+      plist matches.
 
       `pseudocopy install` refuses to run while this service is loaded — do
       not try to register a second agent. To use the built-in installer (for

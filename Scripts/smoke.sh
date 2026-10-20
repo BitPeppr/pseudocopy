@@ -432,6 +432,70 @@ else
     fail "a newer state file is reported"
 fi
 
+# --- the settings file ------------------------------------------------------
+echo "==> settings file"
+CONFIG_FILE="${STATE_ROOT}/config.json"
+
+"${BIN}" config list > "${LOG_DIR}/config-list.log" 2>&1
+STATUS=$?
+check_eq "config list exits 0" "0" "${STATUS}"
+if grep -q "settings file:" "${LOG_DIR}/config-list.log"; then
+    pass "config list prints the settings file"
+else
+    fail "config list prints the settings file"
+fi
+for key in dir ttl interval permanent verbose log-path state-dir \
+           text-limit embed-limit materialise-limit; do
+    if grep -q "$key" "${LOG_DIR}/config-list.log"; then
+        pass "config list shows ${key}"
+    else
+        fail "config list shows ${key}"
+    fi
+done
+
+"${BIN}" config set ttl 600 > "${LOG_DIR}/config-set.log" 2>&1
+STATUS=$?
+check_eq "config set exits 0" "0" "${STATUS}"
+if python3 - "${CONFIG_FILE}" <<'PY' 2>/dev/null
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data.get("ttl") == 600, data
+PY
+then
+    pass "the setting is stored in the settings file"
+else
+    fail "the setting is stored in the settings file"
+fi
+check_eq "the setting is used" "600s" "$("${BIN}" config get ttl)"
+check_eq "the command line wins over the file" "42s" "$("${BIN}" --ttl 42 config get ttl)"
+
+"${BIN}" config unset ttl >/dev/null 2>&1
+check_eq "a setting can be unset" "3600s" "$("${BIN}" config get ttl)"
+
+# A value that the guard refuses must not be stored.
+"${BIN}" config set dir / >/dev/null 2>&1
+check_eq "the watch-folder guard also applies to settings" "1" "$?"
+"${BIN}" config set dir "$HOME" >/dev/null 2>&1
+check_eq "the home folder is refused in the settings too" "1" "$?"
+check_eq "the refused value was not stored" "$HOME/Temp" "$("${BIN}" config get dir)"
+
+# A broken settings file must not stop the tool from working.
+printf '{ not json' > "${CONFIG_FILE}"
+"${BIN}" config list >/dev/null 2>&1
+check_eq "a damaged settings file does not break config list" "0" "$?"
+if [[ -f "${CONFIG_FILE}.corrupt" ]]; then
+    pass "the damaged settings file is kept"
+else
+    fail "the damaged settings file is kept"
+fi
+"${BIN}" config reset >/dev/null 2>&1
+check_eq "config reset removes the settings file" "0" "$?"
+if [[ -f "${CONFIG_FILE}" ]]; then
+    fail "config reset removes the settings file"
+else
+    pass "config reset removes the settings file"
+fi
+
 # --- watch directory guards -------------------------------------------------
 echo "==> watch directory guards"
 "${BIN}" run --dir "${HOME}" >/dev/null 2>&1

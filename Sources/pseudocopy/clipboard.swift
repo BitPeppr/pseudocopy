@@ -17,15 +17,25 @@ enum ClipboardError: Error, CustomStringConvertible {
     }
 }
 
-/// Hard cap for materialising an image or PDF payload. Such a file is copied
-/// into the pasteboard byte for byte, so there has to be a limit — a multi
-/// gigabyte "PDF" would otherwise take the process down with it.
-let materialiseLimitBytes = 256 << 20
+/// The size limits of the pasteboard payloads.
+///
+/// They exist to keep the pasteboard (and the machine) alive: a text file is
+/// copied into memory three times over, an image or PDF byte for byte. The
+/// user may lower them; a hard ceiling keeps them from being removed.
+struct ClipLimits {
+    /// Largest text file that is embedded as text.
+    var text: Int
+    /// Largest generic file whose bytes are embedded.
+    var embed: Int
+    /// Largest image or PDF that is materialised.
+    var materialise: Int
 
-/// Hard cap for a text payload. Text costs about three times its size in
-/// memory (the bytes, the decoded string and the pasteboard's own copy), so
-/// a huge log file would cost three times its size in RAM.
-let textEmbedLimitBytes = 16 << 20
+    static let `default` = ClipLimits(
+        text: Constants.textLimitBytes,
+        embed: Constants.embedLimitBytes,
+        materialise: Constants.materialiseLimitBytes
+    )
+}
 
 /// One file and the representation it should get on the pasteboard.
 struct ClipPayload {
@@ -49,8 +59,8 @@ struct ClipBatch {
 /// Writes one file to the general pasteboard using the representation that
 /// matches its type (§2.2).
 @discardableResult
-func putOnClipboard(kind: FileKind, url: URL, embedLimit: Int) throws -> FileKind {
-    try putFilesOnClipboard(kinds: [kind], urls: [url], embedLimit: embedLimit)[0]
+func putOnClipboard(kind: FileKind, url: URL, limits: ClipLimits) throws -> FileKind {
+    try putFilesOnClipboard(kinds: [kind], urls: [url], limits: limits)[0]
 }
 
 /// Writes several files in one pasteboard transaction.
@@ -60,9 +70,9 @@ func putOnClipboard(kind: FileKind, url: URL, embedLimit: Int) throws -> FileKin
 /// per pasteboard type can exist: the first file of each type contributes its
 /// bytes.
 @discardableResult
-func putFilesOnClipboard(kinds: [FileKind], urls: [URL], embedLimit: Int) throws -> [FileKind] {
+func putFilesOnClipboard(kinds: [FileKind], urls: [URL], limits: ClipLimits) throws -> [FileKind] {
     guard !urls.isEmpty else { return [] }
-    let prepared = prepareClipBatch(kinds: kinds, urls: urls, embedLimit: embedLimit)
+    let prepared = prepareClipBatch(kinds: kinds, urls: urls, limits: limits)
     if let failure = prepared.failures.first {
         throw failure.error
     }
@@ -75,9 +85,9 @@ func putFilesOnClipboard(kinds: [FileKind], urls: [URL], embedLimit: Int) throws
 /// A file that cannot be read does not stop the others: the readable files are
 /// written in one transaction and the failures are reported per input index.
 /// The caller must not mark failed files as handled.
-func putFilesOnClipboardBestEffort(kinds: [FileKind], urls: [URL], embedLimit: Int) throws -> ClipBatch {
+func putFilesOnClipboardBestEffort(kinds: [FileKind], urls: [URL], limits: ClipLimits) throws -> ClipBatch {
     guard !urls.isEmpty else { return ClipBatch(kinds: [], failures: []) }
-    let prepared = prepareClipBatch(kinds: kinds, urls: urls, embedLimit: embedLimit)
+    let prepared = prepareClipBatch(kinds: kinds, urls: urls, limits: limits)
     if !prepared.payloads.isEmpty {
         try writeClipPayloads(prepared.payloads)
     }
@@ -97,7 +107,7 @@ private struct PreparedBatch {
 /// Only the first file of each pasteboard type is materialised. A pasteboard
 /// holds one value per type, so reading a second text file (or a second PNG)
 /// would waste time and memory without changing what can be pasted.
-private func prepareClipBatch(kinds: [FileKind], urls: [URL], embedLimit: Int) -> PreparedBatch {
+private func prepareClipBatch(kinds: [FileKind], urls: [URL], limits: ClipLimits) -> PreparedBatch {
     precondition(kinds.count == urls.count)
     var payloads: [ClipPayload] = []
     var actual: [FileKind?] = Array(repeating: nil, count: urls.count)
@@ -116,7 +126,7 @@ private func prepareClipBatch(kinds: [FileKind], urls: [URL], embedLimit: Int) -
         }
 
         do {
-            let payload = try payload(for: kind, url: urls[index], embedLimit: embedLimit, embed: embed)
+            let payload = try payload(for: kind, url: urls[index], limits: limits, embed: embed)
             if let uti = payload.uti, payload.data != nil {
                 if payload.kind == .text {
                     embeddedText = true
@@ -137,7 +147,7 @@ private func prepareClipBatch(kinds: [FileKind], urls: [URL], embedLimit: Int) -
 ///
 /// `embed` is false for files whose type is already represented: they only
 /// need the file reference, so their bytes are never read.
-private func payload(for kind: FileKind, url: URL, embedLimit: Int, embed: Bool) throws -> ClipPayload {
+private func payload(for kind: FileKind, url: URL, limits: ClipLimits, embed: Bool) throws -> ClipPayload {
     guard embed else {
         return ClipPayload(kind: kind, url: url, uti: nil, data: nil)
     }
@@ -152,10 +162,10 @@ private func payload(for kind: FileKind, url: URL, embedLimit: Int, embed: Bool)
         // A text file that is too big to embed is offered as a file
         // reference instead — otherwise it would cost three times its size in
         // memory.
-        guard size <= textEmbedLimitBytes else {
+        guard size <= limits.text else {
             return ClipPayload(kind: .other, url: url, uti: nil, data: nil)
         }
-        guard let raw = try readCapped(url, limit: textEmbedLimitBytes) else {
+        guard let raw = try readCapped(url, limit: limits.text) else {
             // The file grew between the stat and the read. Do not blow the
             // memory budget: offer the file reference instead.
             return ClipPayload(kind: .other, url: url, uti: nil, data: nil)
@@ -168,23 +178,23 @@ private func payload(for kind: FileKind, url: URL, embedLimit: Int, embed: Bool)
         return ClipPayload(kind: .text, url: url, uti: "public.utf8-plain-text", data: raw)
 
     case .image, .pdf:
-        guard size <= materialiseLimitBytes else {
+        guard size <= limits.materialise else {
             // Too big to materialise: the file reference is the best that can
             // be offered.
             return ClipPayload(kind: .other, url: url, uti: nil, data: nil)
         }
-        guard let data = try readCapped(url, limit: materialiseLimitBytes) else {
+        guard let data = try readCapped(url, limit: limits.materialise) else {
             return ClipPayload(kind: .other, url: url, uti: nil, data: nil)
         }
         return ClipPayload(kind: kind, url: url, uti: uti(for: url), data: data)
 
     case .other:
-        guard size <= embedLimit else {
+        guard size <= limits.embed else {
             // A file over the limit is never embedded, so it never has to be
             // read into memory at all.
             return ClipPayload(kind: .other, url: url, uti: nil, data: nil)
         }
-        guard let data = try readCapped(url, limit: embedLimit) else {
+        guard let data = try readCapped(url, limit: limits.embed) else {
             return ClipPayload(kind: .other, url: url, uti: nil, data: nil)
         }
         return ClipPayload(kind: .other, url: url, uti: uti(for: url), data: data)

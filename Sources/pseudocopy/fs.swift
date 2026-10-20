@@ -339,8 +339,8 @@ func isRunningAsAgent() -> Bool {
 /// Keeps the agent log private. Launchd creates the file with the default
 /// umask (0644); the built-in installer chmods it, but `brew services` never
 /// runs that code. The log lists the names of the files that were copied.
-private func ensureLogIsPrivate() {
-    let path = AgentPaths.logURL.path
+private func ensureLogIsPrivate(_ logPath: URL) {
+    let path = logPath.path
     guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
           let permissions = attributes[.posixPermissions] as? NSNumber,
           permissions.intValue & 0o777 != 0o600 else { return }
@@ -385,10 +385,10 @@ func runCycle(config: Configuration) throws {
 private func performCycle(config: Configuration, clipping: Bool, force: Bool) throws {
     Logger.verbose = config.verbose
     if isRunningAsAgent() {
-        ensureLogIsPrivate()
+        ensureLogIsPrivate(config.logPath)
     }
 
-    var store = StateStore(watchDir: config.watchDir)
+    var store = StateStore(watchDir: config.watchDir, root: config.stateDir)
 
     // Guard against overlapping invocations (§2.6): launchd starts a new
     // cycle every 5 seconds, a slow cycle (a 64 MB embed) could still run.
@@ -477,7 +477,11 @@ private func performCycle(config: Configuration, clipping: Bool, force: Bool) th
                     let batch = try putFilesOnClipboardBestEffort(
                         kinds: candidates.map { classifyFile($0.entry.url) },
                         urls: candidates.map { $0.entry.url },
-                        embedLimit: config.embedLimitBytes
+                        limits: ClipLimits(
+                            text: config.textLimitBytes,
+                            embed: config.embedLimitBytes,
+                            materialise: config.materialiseLimitBytes
+                        )
                     )
                     for (index, candidate) in candidates.enumerated() {
                         guard let written = batch.kinds[index] else {
@@ -656,7 +660,11 @@ func clipPaths(_ paths: [String], config: Configuration) throws {
 
     // One transaction for all files: a pasteboard holds one value per type,
     // but every file is offered as a file reference.
-    let written = try putFilesOnClipboard(kinds: kinds, urls: urls, embedLimit: config.embedLimitBytes)
+    let written = try putFilesOnClipboard(kinds: kinds, urls: urls, limits: ClipLimits(
+        text: config.textLimitBytes,
+        embed: config.embedLimitBytes,
+        materialise: config.materialiseLimitBytes
+    ))
     for (index, url) in urls.enumerated() {
         Logger.log(.clip, written[index].rawValue, displayPath(url))
     }
