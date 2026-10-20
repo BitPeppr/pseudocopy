@@ -145,8 +145,33 @@ private func scanEntries(_ dir: URL, previous: [String: Fingerprint]) throws -> 
     return entries
 }
 
+/// True when the reaper may act on a file (§2.3).
+///
+/// A file counts as settled when the state store knows it and its content
+/// did not grow since the last observation:
+/// - the fingerprint is identical to the previous scan (2-scan stable), or
+/// - the fingerprint is the one that was clipped, or
+/// - the size is unchanged since the last observation (the file is not being
+///   written any more — e.g. it was only touched, or a stalled download has
+///   stopped growing).
+private func isSettledForReaping(record: StateRecord?, observed: Fingerprint) -> Bool {
+    guard let record = record else {
+        // Never observed before: the state store does not mark it as settled.
+        return false
+    }
+    if record.lastFingerprint == observed { return true }
+    if record.clippedFingerprint == observed { return true }
+    if record.lastFingerprint.size == observed.size { return true }
+    return false
+}
+
 /// One watch + reap cycle (§2.1, §2.3, §4.3).
 func runCycle(config: Configuration) throws {
+    try performCycle(config: config, clipping: true)
+}
+
+/// The shared cycle: scan → clip → reap → prune → save.
+private func performCycle(config: Configuration, clipping: Bool) throws {
     Logger.verbose = config.verbose
 
     var store = StateStore(watchDir: config.watchDir)
@@ -159,39 +184,76 @@ func runCycle(config: Configuration) throws {
     let now = Date()
 
     // --- clip pass -------------------------------------------------------
+    if clipping {
+        for entry in entries {
+            guard case .settled = entry.verification, let current = entry.fingerprint else {
+                continue
+            }
+            if records[entry.path]?.clippedFingerprint == current {
+                Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) already clipped")
+                continue
+            }
+            if isExpired(entry.url, now: now, ttl: config.ttl) {
+                // About to be reaped — do not put it on the pasteboard.
+                Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) expired, not clipping")
+                continue
+            }
+
+            let kind = classifyFile(entry.url)
+            let written: FileKind
+            do {
+                written = try putOnClipboard(kind: kind, url: entry.url, embedLimit: config.embedLimitBytes)
+            } catch {
+                Logger.log(.error, "clip", "\(displayPath(entry.url)): \(error.localizedDescription)")
+                continue
+            }
+            Logger.log(.clip, written.rawValue, displayPath(entry.url))
+
+            var record = records[entry.path] ?? StateRecord(lastFingerprint: current, clippedFingerprint: nil)
+            record.lastFingerprint = current
+            record.clippedFingerprint = current
+            records[entry.path] = record
+        }
+    }
+
+    // --- reap pass -------------------------------------------------------
+    // `records` still holds the fingerprints of the previous scan here, which
+    // is exactly the "settled" signal the reaper needs (§2.3).
+    var reaped = Set<String>()
     for entry in entries {
-        guard case .settled = entry.verification, let current = entry.fingerprint else {
+        guard let observed = entry.fingerprint else { continue }
+        guard isExpired(entry.url, now: now, ttl: config.ttl) else { continue }
+
+        let record = records[entry.path]
+        guard isSettledForReaping(record: record, observed: observed) else {
+            Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) expired but not settled, keeping it")
             continue
         }
-        if records[entry.path]?.clippedFingerprint == current {
-            Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) already clipped")
-            continue
-        }
-        if isExpired(entry.url, now: now, ttl: config.ttl) {
-            // About to be reaped — do not put it on the pasteboard.
-            Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) expired, not clipping")
+        // Safety net: the file must not have changed since the scan.
+        guard let current = try? fingerprint(of: entry.url), current == observed else {
+            Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) still changing, keeping it")
             continue
         }
 
-        let kind = classifyFile(entry.url)
-        let written: FileKind
         do {
-            written = try putOnClipboard(kind: kind, url: entry.url, embedLimit: config.embedLimitBytes)
+            if config.permanent {
+                try FileManager.default.removeItem(at: entry.url)
+            } else {
+                try FileManager.default.trashItem(at: entry.url, resultingItemURL: nil)
+            }
+            reaped.insert(entry.path)
+            Logger.log(.reap, "file", displayPath(entry.url))
         } catch {
-            Logger.log(.error, "clip", "\(displayPath(entry.url)): \(error.localizedDescription)")
-            continue
+            Logger.log(.error, "reap", "\(displayPath(entry.url)): \(error.localizedDescription)")
         }
-        Logger.log(.clip, written.rawValue, displayPath(entry.url))
-
-        var record = records[entry.path] ?? StateRecord(lastFingerprint: current, clippedFingerprint: nil)
-        record.lastFingerprint = current
-        record.clippedFingerprint = current
-        records[entry.path] = record
+    }
+    for path in reaped {
+        records.removeValue(forKey: path)
     }
 
     // --- settle bookkeeping ----------------------------------------------
     var scan: [String: Fingerprint] = [:]
-    for entry in entries {
+    for entry in entries where !reaped.contains(entry.path) {
         guard let fingerprint = entry.fingerprint else { continue }
         scan[entry.path] = fingerprint
         var record = records[entry.path] ?? StateRecord(lastFingerprint: fingerprint, clippedFingerprint: nil)
@@ -241,7 +303,7 @@ func runLoop(config: Configuration, interval: TimeInterval) throws {
 
 /// Force-reap everything older than the TTL right now (§2.7).
 func runClean(config: Configuration) throws {
-    CLI.fail("clean is not implemented yet")
+    try performCycle(config: config, clipping: false)
 }
 
 /// Clip files manually, bypassing the settle logic (§2.7).
