@@ -47,6 +47,26 @@ enum Launchctl {
         "\(domain)/\(Constants.agentLabel)"
     }
 
+    /// The full launchd label for a service name.
+    static func label(for name: String) -> String {
+        "\(domain)/\(name)"
+    }
+
+    /// The loaded agent, if any: the one `pseudocopy install` owns first,
+    /// then the ones `brew services` may have created.
+    static func loadedAgent() -> (name: String, output: String)? {
+        for name in [Constants.agentLabel] + Constants.homebrewAgentLabels {
+            let result = run(["print", label(for: name)])
+            if result.status == 0 { return (name, result.output) }
+        }
+        return nil
+    }
+
+    /// True when this label belongs to a Homebrew-managed service.
+    static func isHomebrew(label name: String) -> Bool {
+        Constants.homebrewAgentLabels.contains(name)
+    }
+
     /// Runs `launchctl` with the given arguments.
     @discardableResult
     static func run(_ arguments: [String]) -> LaunchctlResult {
@@ -113,6 +133,15 @@ func launchAgentPlist(binaryPath: String, watchDir: String, ttl: TimeInterval, h
 func installAgent(config: Configuration) throws {
     let fileManager = FileManager.default
 
+    // Two agents would double the clipboard traffic. If Homebrew already
+    // manages the service, the built-in install has to wait.
+    if let agent = Launchctl.loadedAgent(), Launchctl.isHomebrew(label: agent.name) {
+        throw CLIError.usage("""
+            a Homebrew-managed service is already running (\(agent.name)); \
+            run 'brew services stop pseudocopy' first, or keep using brew services
+            """)
+    }
+
     // The watch directory has to exist before the agent starts.
     try fileManager.createDirectory(at: config.watchDir, withIntermediateDirectories: true,
                                     attributes: [.posixPermissions: 0o700])
@@ -159,34 +188,57 @@ func installAgent(config: Configuration) throws {
 }
 
 /// Removes the LaunchAgent and its plist (§5).
+///
+/// Only the agent written by `pseudocopy install` is touched. A Homebrew
+/// service belongs to `brew services` and is left alone.
 func uninstallAgent() throws {
-    let result = Launchctl.run(["bootout", Launchctl.label])
-    if result.status != 0 {
-        Logger.log(.info, "agent", "bootout: \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+    let hadPlist = FileManager.default.fileExists(atPath: AgentPaths.plistURL.path)
+    let builtInLoaded = Launchctl.loadedAgent()?.name == Constants.agentLabel
+
+    guard hadPlist || builtInLoaded else {
+        print("nothing to uninstall — no agent was written by 'pseudocopy install'")
+        if let agent = Launchctl.loadedAgent(), Launchctl.isHomebrew(label: agent.name) {
+            print("  \(agent.name) is managed by Homebrew: brew services stop pseudocopy")
+        }
+        return
     }
-    if FileManager.default.fileExists(atPath: AgentPaths.plistURL.path) {
+
+    if builtInLoaded {
+        let result = Launchctl.run(["bootout", Launchctl.label])
+        if result.status != 0 {
+            Logger.log(.info, "agent", "bootout: \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+    }
+    if hadPlist {
         try FileManager.default.removeItem(at: AgentPaths.plistURL)
     }
     print("uninstalled \(Constants.agentLabel)")
     print("  watch dir and state are kept")
+    if let agent = Launchctl.loadedAgent(), Launchctl.isHomebrew(label: agent.name) {
+        print("  note: \(agent.name) is managed by Homebrew: brew services stop pseudocopy")
+    }
 }
 
 /// Forces one cycle of the running agent right now (§5.3).
 func kickAgent() throws {
-    let result = Launchctl.run(["kickstart", Launchctl.label])
-    guard result.status == 0 else {
-        throw CLIError.usage("could not start a cycle: \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+    guard let agent = Launchctl.loadedAgent() else {
+        throw CLIError.usage("pseudocopy is not loaded")
     }
-    print("kicked \(Constants.agentLabel)")
+    let result = Launchctl.run(["kickstart", Launchctl.label(for: agent.name)])
+    guard result.status == 0 else {
+        throw CLIError.usage("could not start a cycle of \(agent.name): \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+    print("kicked \(agent.name)")
 }
 
 /// Prints the agent status; exits 1 when the agent is not loaded (§5.3).
 func printAgentStatus() throws {
-    let result = Launchctl.run(["print", Launchctl.label])
-    if result.status == 0 {
-        print(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
-        return
+    guard let agent = Launchctl.loadedAgent() else {
+        let names = ([Constants.agentLabel] + Constants.homebrewAgentLabels).joined(separator: ", ")
+        throw CLIError.usage("pseudocopy is not loaded (checked \(names))")
     }
-    FileHandle.standardError.write(Data((result.output.trimmingCharacters(in: .whitespacesAndNewlines) + "\n").utf8))
-    throw CLIError.usage("\(Constants.agentLabel) is not loaded")
+    print(agent.output.trimmingCharacters(in: .whitespacesAndNewlines))
+    if Launchctl.isHomebrew(label: agent.name) {
+        print("\nmanaged by Homebrew — use 'brew services' to start, stop or restart it")
+    }
 }

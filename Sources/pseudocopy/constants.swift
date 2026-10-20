@@ -4,7 +4,7 @@ import Foundation
 enum Constants {
     /// The released version. `Scripts/release.sh` reads this value and
     /// refuses to publish a tag that does not match it.
-    static let version = "1.0.0"
+    static let version = "1.0.1"
 
     /// Seconds between cycles when running in resident `loop` mode.
     /// The LaunchAgent uses the same value as its `StartInterval`.
@@ -18,6 +18,15 @@ enum Constants {
 
     /// LaunchAgent label.
     static let agentLabel = "com.pseudocopy"
+
+    /// Formula name used by `brew services` in the launchd label.
+    static let homebrewFormulaName = "pseudocopy"
+
+    /// Labels a Homebrew-managed service may use. Homebrew 5 names the agent
+    /// `sh.brew.<formula>`; older versions used `homebrew.mxcl.<formula>`.
+    static var homebrewAgentLabels: [String] {
+        ["sh.brew." + homebrewFormulaName, "homebrew.mxcl." + homebrewFormulaName]
+    }
 
     /// Folder name inside `~/Library/Application Support`.
     static let appSupportFolder = "pseudocopy"

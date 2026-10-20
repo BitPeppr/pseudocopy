@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [semantic versioning](https://semver.org/).
 
+## [1.0.1] — 2026-10-20
+
+### Fixed
+
+- `status` and `kick` now find the agent when it is managed by
+  `brew services` (Homebrew 5 uses `sh.brew.pseudocopy`; older versions use
+  `homebrew.mxcl.pseudocopy`) instead of only looking for the label written
+  by `pseudocopy install`.
+- `install` refuses to register a second agent while a Homebrew-managed
+  service is running, and `uninstall` no longer claims to have removed it.
+
 ## [1.0.0] — 2026-10-20
 
 First release.
