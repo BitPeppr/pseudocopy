@@ -80,11 +80,12 @@ private func convertImage(from source: URL, to destination: URL, format: String)
 
 /// A minimal single page PDF with a correct cross reference table.
 private func minimalPDF() -> Data {
+    let stream = "BT /F1 18 Tf 20 100 Td (pseudocopy) Tj ET"
     let objects = [
         "<< /Type /Catalog /Pages 2 0 R >>",
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
-        "<< /Length 45 >>\nstream\nBT /F1 18 Tf 20 100 Td (pseudocopy) Tj ET\nendstream",
+        "<< /Length \(stream.utf8.count) >>\nstream\n\(stream)\nendstream",
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
 

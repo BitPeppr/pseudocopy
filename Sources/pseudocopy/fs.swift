@@ -36,6 +36,10 @@ struct ScanEntry {
     /// Normalized path, used as the state store key.
     var path: String
     var fingerprint: Fingerprint?
+    /// Creation date of the file (as reported by the file system).
+    var created: Date?
+    /// Modification date of the file.
+    var modified: Date?
     var verification: FileVerification
 }
 
@@ -95,11 +99,9 @@ func fingerprint(of url: URL) throws -> Fingerprint? {
 
 /// True when the file is older than the TTL (§2.3). The older of the
 /// creation and the modification date decides.
-func isExpired(_ url: URL, now: Date, ttl: TimeInterval) -> Bool {
-    let keys: Set<URLResourceKey> = [.creationDateKey, .contentModificationDateKey]
-    guard let values = try? url.resourceValues(forKeys: keys) else { return false }
-    let mtime = values.contentModificationDate ?? now
-    let ctime = values.creationDate ?? mtime
+func isExpired(created: Date?, modified: Date?, now: Date, ttl: TimeInterval) -> Bool {
+    guard let mtime = modified else { return false }
+    let ctime = created ?? mtime
     return min(ctime, mtime).timeIntervalSince(now) < -ttl
 }
 
@@ -121,151 +123,211 @@ func displayPath(_ url: URL) -> String {
 
 // MARK: - Process lock (§2.6)
 
-/// A PID based lock file that keeps two cycles from overlapping.
+/// The result of trying to take the process lock.
+enum LockResult {
+    /// The lock was taken.
+    case acquired
+    /// Another cycle is running.
+    case held
+    /// The lock could not be taken at all — the tool must not pretend to work.
+    case failed(String)
+}
+
+/// A lock file that keeps two cycles from overlapping.
 ///
-/// The lock file contains the PID of the owning process. When the file
-/// exists, the PID is checked with `kill(pid, 0)`: a live owner means another
-/// cycle is running, a dead owner means the lock is stale and can be taken
-/// over.
+/// The lock file contains the PID of the owning process, but the mutual
+/// exclusion itself is done with `flock(2)`: the kernel drops the lock when
+/// the owner dies, so a lock file left behind by a killed process can never
+/// wedge the tool. Deciding staleness from the PID alone is not safe — the
+/// PID may have been recycled by an unrelated process, which would leave
+/// pseudocopy silently doing nothing forever.
 final class ProcessLock {
     private let url: URL
     private var descriptor: Int32 = -1
-    private var ownsLock = false
 
     init(url: URL) {
         self.url = url
     }
 
-    /// Tries to take the lock. Returns false when another process holds it.
-    func acquire() -> Bool {
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-
-        if createLockFile() {
-            ownsLock = true
-            return true
+    /// Tries to take the lock.
+    func acquire() -> LockResult {
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            return .failed("could not create \(url.deletingLastPathComponent().path): \(error.localizedDescription)")
         }
 
-        if let pid = readPID(), pid != getpid(), isAlive(pid) {
-            // Another cycle is still running.
-            return false
+        let handle = open(url.path, O_CREAT | O_RDWR, 0o600)
+        guard handle >= 0 else {
+            return .failed("could not open \(url.path): \(String(cString: strerror(errno)))")
         }
-
-        // Stale lock (or our own leftover): remove it and try once more.
-        try? FileManager.default.removeItem(at: url)
-        if createLockFile() {
-            ownsLock = true
-            return true
+        guard flock(handle, LOCK_EX | LOCK_NB) == 0 else {
+            // Another cycle is running — leave its lock alone.
+            close(handle)
+            return .held
         }
-        return false
-    }
+        descriptor = handle
 
-    /// Removes the lock file again.
-    func release() {
-        guard ownsLock else { return }
-        ownsLock = false
-        if descriptor >= 0 {
-            close(descriptor)
-            descriptor = -1
-        }
-        try? FileManager.default.removeItem(at: url)
-    }
-
-    private func createLockFile() -> Bool {
-        let handle = open(url.path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
-        guard handle >= 0 else { return false }
+        // The PID is informational only; it never decides staleness.
+        ftruncate(handle, 0)
+        lseek(handle, 0, SEEK_SET)
         let pid = "\(getpid())\n"
         _ = pid.withCString { pointer in
             write(handle, pointer, strlen(pointer))
         }
-        descriptor = handle
-        return true
+        return .acquired
     }
 
-    private func readPID() -> pid_t? {
-        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
-        let text = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let text = text, let value = Int(text), value > 0 else { return nil }
-        return pid_t(value)
-    }
-
-    private func isAlive(_ pid: pid_t) -> Bool {
-        if kill(pid, 0) == 0 { return true }
-        return errno == EPERM
+    /// Releases the lock. The file itself is left in place on purpose:
+    /// unlinking it would race with a process that already opened it.
+    func release() {
+        guard descriptor >= 0 else { return }
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+        descriptor = -1
     }
 }
 
 // MARK: - Cycle
 
 /// Scans the watch directory and classifies every top level entry.
+///
+/// A missing watch directory is recreated when its parent still exists (the
+/// user may simply have deleted it); when the parent is gone as well the
+/// volume is probably not mounted, and the agent stays quiet instead of
+/// filling the log every five seconds.
 private func scanEntries(_ dir: URL, previous: [String: Fingerprint]) throws -> [ScanEntry] {
     var isDirectory: ObjCBool = false
     let exists = FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDirectory)
-    guard exists && isDirectory.boolValue else {
-        throw CLIError.usage("watch directory does not exist: \(dir.path)")
+
+    if !exists {
+        let parent = dir.deletingLastPathComponent()
+        if FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                                     attributes: [.posixPermissions: 0o700])
+            Logger.verboseLog(.error, "dir", "recreated the watch directory \(dir.path)")
+        } else if isRunningAsAgent() {
+            // The volume is not mounted — there is nothing to do and nobody to
+            // tell: the agent would otherwise log this every five seconds.
+            Logger.verboseLog(.error, "dir", "watch directory \(dir.path) is unavailable")
+            return []
+        } else {
+            throw CLIError.usage("watch directory does not exist: \(dir.path)")
+        }
+    } else if !isDirectory.boolValue {
+        throw CLIError.usage("watch directory is not a directory: \(dir.path)")
     }
 
     var entries: [ScanEntry] = []
     for url in try topLevelEntries(dir) {
         let path = normalizedPath(url)
         if partialFileExtension(url.lastPathComponent) {
-            entries.append(ScanEntry(url: url, path: path, fingerprint: nil, verification: .partial))
+            entries.append(ScanEntry(url: url, path: path, fingerprint: nil, created: nil, modified: nil, verification: .partial))
             continue
         }
-        guard let fingerprint = try fingerprint(of: url) else {
-            entries.append(ScanEntry(url: url, path: path, fingerprint: nil, verification: .ignored))
+        // One stat per file: the values are reused for the fingerprint, the
+        // expiry check and the settle comparison.
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .creationDateKey])
+        guard let size = values?.fileSize, let mtime = values?.contentModificationDate else {
+            // The file vanished between the listing and the stat — that is
+            // normal, not an error worth aborting the cycle for.
+            entries.append(ScanEntry(url: url, path: path, fingerprint: nil, created: nil, modified: nil, verification: .ignored))
             continue
         }
+        let fingerprint = Fingerprint(size: size, mtime: mtime)
         let verification: FileVerification = (previous[path] == fingerprint) ? .settled(fingerprint) : .settling
-        entries.append(ScanEntry(url: url, path: path, fingerprint: fingerprint, verification: verification))
+        entries.append(ScanEntry(
+            url: url,
+            path: path,
+            fingerprint: fingerprint,
+            created: values?.creationDate,
+            modified: mtime,
+            verification: verification
+        ))
     }
     return entries
 }
 
+/// True when this process was started by the LaunchAgent.
+func isRunningAsAgent() -> Bool {
+    ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] == Constants.agentLabel
+}
+
 /// True when the reaper may act on a file (§2.3).
 ///
-/// A file counts as settled when the state store knows it and its content
-/// did not grow since the last observation:
-/// - the fingerprint is identical to the previous scan (2-scan stable), or
-/// - the fingerprint is the one that was clipped, or
-/// - the size is unchanged since the last observation (the file is not being
-///   written any more — e.g. it was only touched, or a stalled download has
-///   stopped growing).
-private func isSettledForReaping(record: StateRecord?, observed: Fingerprint) -> Bool {
+/// "Settled" means the state store knows the file and its fingerprint did
+/// not change since the previous observation — a file that is still being
+/// written changes its size or its modification time. A file that was already
+/// copied to the pasteboard is known to be complete.
+///
+/// `force` is used by the explicit `clean` command: there the user asked for
+/// the old files to go, so files that were never seen before are reaped too
+/// (the file is re-read right before it is moved, so a file that is being
+/// written right now is still spared).
+private func isSettledForReaping(record: StateRecord?, observed: Fingerprint, force: Bool) -> Bool {
+    if force {
+        // The user asked for it explicitly. The file is read again right
+        // before it is moved, so a file that is being written right now is
+        // still spared.
+        return true
+    }
     guard let record = record else {
         // Never observed before: the state store does not mark it as settled.
         return false
     }
     if record.lastFingerprint == observed { return true }
     if record.clippedFingerprint == observed { return true }
-    if record.lastFingerprint.size == observed.size { return true }
     return false
+}
+
+/// The single most recently modified settled file, used when the state store
+/// had to be rebuilt and everything looks new at once.
+private func newestSettled(_ entries: [ScanEntry]) -> [ScanEntry] {
+    let settled = entries.filter { entry in
+        if case .settled = entry.verification { return true }
+        return false
+    }
+    guard let newest = settled.max(by: { ($0.modified ?? .distantPast) < ($1.modified ?? .distantPast) }) else {
+        return []
+    }
+    return [newest]
 }
 
 /// One watch + reap cycle (§2.1, §2.3, §4.3).
 func runCycle(config: Configuration) throws {
-    try performCycle(config: config, clipping: true)
+    try performCycle(config: config, clipping: true, force: false)
 }
 
 /// The shared cycle: scan → clip → reap → prune → save.
-private func performCycle(config: Configuration, clipping: Bool) throws {
+private func performCycle(config: Configuration, clipping: Bool, force: Bool) throws {
     Logger.verbose = config.verbose
 
     var store = StateStore(watchDir: config.watchDir)
-    store.load()
 
     // Guard against overlapping invocations (§2.6): launchd starts a new
     // cycle every 5 seconds, a slow cycle (a 64 MB embed) could still run.
+    // The lock is taken before the state is read, so that two cycles can
+    // never work on the same snapshot.
     let lock = ProcessLock(url: store.lockFileURL)
-    guard lock.acquire() else {
+    switch lock.acquire() {
+    case .acquired:
+        break
+    case .held:
         Logger.verboseLog(.cycle, "lock", "another cycle is running — skipping")
         return
+    case .failed(let reason):
+        // Not being able to lock is not the same as another cycle running:
+        // the tool must not pretend that it works.
+        Logger.log(.error, "lock", reason)
+        throw CLIError.usage("could not acquire the lock: \(reason)")
     }
     defer { lock.release() }
 
+    store.load()
     let previous = store.lastScan
     var records = store.records
 
@@ -274,17 +336,17 @@ private func performCycle(config: Configuration, clipping: Bool) throws {
 
     // --- clip pass -------------------------------------------------------
     if clipping {
-        for entry in entries {
+        // After a state reset every file looks brand new. Clipping all of
+        // them at once would leave the clipboard with an arbitrary file, so
+        // only the newest one is copied in that cycle.
+        let clipCandidates = store.wasReset ? newestSettled(entries) : entries
+
+        for entry in clipCandidates {
             guard case .settled = entry.verification, let current = entry.fingerprint else {
                 continue
             }
             if records[entry.path]?.clippedFingerprint == current {
                 Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) already clipped")
-                continue
-            }
-            if isExpired(entry.url, now: now, ttl: config.ttl) {
-                // About to be reaped — do not put it on the pasteboard.
-                Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) expired, not clipping")
                 continue
             }
 
@@ -293,6 +355,7 @@ private func performCycle(config: Configuration, clipping: Bool) throws {
             do {
                 written = try putOnClipboard(kind: kind, url: entry.url, embedLimit: config.embedLimitBytes)
             } catch {
+                // The file stays unclipped and is retried on the next cycle.
                 Logger.log(.error, "clip", "\(displayPath(entry.url)): \(error.localizedDescription)")
                 continue
             }
@@ -311,10 +374,10 @@ private func performCycle(config: Configuration, clipping: Bool) throws {
     var reaped = Set<String>()
     for entry in entries {
         guard let observed = entry.fingerprint else { continue }
-        guard isExpired(entry.url, now: now, ttl: config.ttl) else { continue }
+        guard isExpired(created: entry.created, modified: entry.modified, now: now, ttl: config.ttl) else { continue }
 
         let record = records[entry.path]
-        guard isSettledForReaping(record: record, observed: observed) else {
+        guard isSettledForReaping(record: record, observed: observed, force: force) else {
             Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) expired but not settled, keeping it")
             continue
         }
@@ -362,11 +425,9 @@ private func performCycle(config: Configuration, clipping: Bool) throws {
     }
 
     // --- prune + save ----------------------------------------------------
-    // Records of files that no longer exist are dropped (§2.3).
-    var missing = Set<String>()
-    for path in records.keys where !FileManager.default.fileExists(atPath: path) {
-        missing.insert(path)
-    }
+    // Records of files that are gone are dropped (§2.3). Everything that is
+    // still on disk is in `scan`, so no extra stat calls are needed.
+    let missing = Set(records.keys).subtracting(scan.keys)
     for path in missing {
         records.removeValue(forKey: path)
     }
@@ -396,7 +457,9 @@ func runLoop(config: Configuration, interval: TimeInterval) throws {
 
 /// Force-reap everything older than the TTL right now (§2.7).
 func runClean(config: Configuration) throws {
-    try performCycle(config: config, clipping: false)
+    // `clean` is an explicit request: files that are older than the TTL go
+    // now, even when they were never seen before.
+    try performCycle(config: config, clipping: false, force: true)
 }
 
 /// Clip files manually, bypassing the settle logic (§2.7).
@@ -404,7 +467,7 @@ func clipPaths(_ paths: [String], config: Configuration) throws {
     guard !paths.isEmpty else {
         throw CLIError.usage("clip needs at least one file path")
     }
-    for path in paths {
+    for (index, path) in paths.enumerated() {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
             .standardizedFileURL
             .resolvingSymlinksInPath()
@@ -413,7 +476,14 @@ func clipPaths(_ paths: [String], config: Configuration) throws {
             throw CLIError.usage("not a file: \(path)")
         }
         let kind = classifyFile(url)
-        let written = try putOnClipboard(kind: kind, url: url, embedLimit: config.embedLimitBytes)
+        // The pasteboard is emptied once, so that several files can be put on
+        // it at the same time.
+        let written = try writeToPasteboard(
+            kind: kind,
+            url: url,
+            embedLimit: config.embedLimitBytes,
+            clearing: index == 0
+        )
         Logger.log(.clip, written.rawValue, displayPath(url))
     }
 }

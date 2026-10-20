@@ -2,8 +2,8 @@
 #
 # Headless smoke test for pseudocopy (§6, Phase 8).
 #
-# Builds the tool, runs a full cycle in a sandbox directory and checks
-# clipping, reaping and the exclusion of partial downloads.
+# Builds the tool, runs full cycles in a private sandbox directory and checks
+# clipping, reaping, the exclusion rules and the process lock.
 #
 # NOTE: this test writes to the system pasteboard. The previous clipboard
 #       content is restored when the script finishes.
@@ -12,12 +12,12 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-SANDBOX="${PSEUDOCOPY_SMOKE_DIR:-/tmp/pseudocopy-smoke}"
 BIN="${ROOT_DIR}/.build/debug/pseudocopy"
 STATE_FILE="${HOME}/Library/Application Support/pseudocopy/state.json"
 
 FAILURES=0
-LOG_DIR="$(mktemp -d)"
+LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pseudocopy-smoke-logs.XXXXXX")"
+SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/pseudocopy-smoke.XXXXXX")"
 
 pass() { printf '  ok    %s\n' "$1"; }
 fail() { printf '  FAIL  %s\n' "$1"; FAILURES=$((FAILURES + 1)); }
@@ -32,6 +32,20 @@ check_eq() {
     fi
 }
 
+# Records of one watch folder inside the state store.
+state_records() {
+    python3 - "$STATE_FILE" "$1" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+records = data.get("dirs", {}).get(sys.argv[2], {})
+for path in records:
+    print(path)
+PY
+}
+
 # --- clipboard backup ------------------------------------------------------
 CLIP_BACKUP="${LOG_DIR}/clipboard.txt"
 if pbpaste > "${CLIP_BACKUP}" 2>/dev/null; then
@@ -39,11 +53,11 @@ if pbpaste > "${CLIP_BACKUP}" 2>/dev/null; then
 else
     : > "${CLIP_BACKUP}"
 fi
-restore_clipboard() {
+cleanup() {
     pbcopy < "${CLIP_BACKUP}" 2>/dev/null || true
-    rm -rf "${LOG_DIR}"
+    rm -rf "${LOG_DIR}" "${SANDBOX}"
 }
-trap restore_clipboard EXIT
+trap cleanup EXIT
 
 # --- build -----------------------------------------------------------------
 echo "==> building"
@@ -57,10 +71,13 @@ pass "swift build"
 
 # --- sandbox ---------------------------------------------------------------
 echo "==> sandbox: ${SANDBOX}"
-rm -rf "${SANDBOX}"
-mkdir -p "${SANDBOX}"
+NS_KEY="$(cd "${SANDBOX}" && pwd -P)"
 printf 'pseudocopy smoke test\n' > "${SANDBOX}/sample.txt"
 printf 'partial download in progress\n' > "${SANDBOX}/sample.still-downloading.crdownload"
+printf 'partial download in progress\n' > "${SANDBOX}/sample.part"
+printf 'dotfile\n' > "${SANDBOX}/.hidden.txt"
+mkdir -p "${SANDBOX}/a-directory"
+ln -sf "${SANDBOX}/sample.txt" "${SANDBOX}/a-symlink.txt"
 printf 'pseudocopy-smoke-marker\n' | pbcopy
 
 # --- cycle 1: the file is still settling ------------------------------------
@@ -85,16 +102,41 @@ else
     fail "cycle 2 logs a clip event"
 fi
 
-# --- partial downloads are ignored -----------------------------------------
-echo "==> partial downloads"
-check_eq "the partial download is not clipped" "pseudocopy smoke test" "$(pbpaste)"
-if [[ -f "${STATE_FILE}" ]] && grep -q "crdownload" "${STATE_FILE}"; then
-    fail "the partial download has no state record"
+# --- cycle 3: nothing is clipped twice --------------------------------------
+echo "==> cycle 3 (no re-clip)"
+printf 'pseudocopy-smoke-marker\n' | pbcopy
+"${BIN}" run --dir "${SANDBOX}" --ttl 1 --verbose > "${LOG_DIR}/run3.log" 2>&1
+check_eq "cycle 3 leaves the clipboard alone" "pseudocopy-smoke-marker" "$(pbpaste)"
+if grep -q "\[clip\]" "${LOG_DIR}/run3.log"; then
+    fail "cycle 3 does not clip again"
 else
-    pass "the partial download has no state record"
+    pass "cycle 3 does not clip again"
 fi
 
-# --- reaping ---------------------------------------------------------------
+# --- exclusion rules --------------------------------------------------------
+echo "==> exclusion rules"
+check_eq "the partial download is not clipped" "pseudocopy-smoke-marker" "$(pbpaste)"
+RECORDS="$(state_records "${NS_KEY}")"
+if [[ -z "${RECORDS}" ]] || ! grep -qE "crdownload|\.part|a-directory|a-symlink|hidden" <<< "${RECORDS}"; then
+    pass "no state record for partial downloads, dotfiles, directories or symlinks"
+else
+    fail "no state record for partial downloads, dotfiles, directories or symlinks"
+fi
+
+# --- the lock ---------------------------------------------------------------
+echo "==> process lock"
+printf 'lock test\n' > "${SANDBOX}/lock-test.txt"
+"${BIN}" run --dir "${SANDBOX}" --ttl 1 >/dev/null 2>&1   # first sighting: settling
+# Two cycles at the same time: exactly one of them may clip the file.
+"${BIN}" run --dir "${SANDBOX}" --ttl 1 --verbose > "${LOG_DIR}/lock1.log" 2>&1 &
+PID1=$!
+"${BIN}" run --dir "${SANDBOX}" --ttl 1 --verbose > "${LOG_DIR}/lock2.log" 2>&1 &
+PID2=$!
+wait "${PID1}" "${PID2}"
+CLIPS="$(cat "${LOG_DIR}/lock1.log" "${LOG_DIR}/lock2.log" | grep -c "\[clip\]" || true)"
+check_eq "two parallel cycles clip only once" "1" "${CLIPS}"
+
+# --- reaping ----------------------------------------------------------------
 echo "==> reaping"
 # macOS touch(1) has no relative offsets: build an absolute timestamp.
 OLD_STAMP="$(date -v-2H +%Y%m%d%H%M.%S)"
@@ -111,13 +153,23 @@ if [[ -f "${SANDBOX}/sample.still-downloading.crdownload" ]]; then
 else
     fail "the partial download is left alone"
 fi
-if [[ -f "${STATE_FILE}" ]] && grep -q "sample.txt" "${STATE_FILE}"; then
-    fail "the state record of the reaped file is pruned"
+if [[ -d "${SANDBOX}/a-directory" ]]; then
+    pass "directories are left alone"
 else
+    fail "directories are left alone"
+fi
+if [[ -L "${SANDBOX}/a-symlink.txt" ]]; then
+    pass "symlinks are left alone"
+else
+    fail "symlinks are left alone"
+fi
+if ! state_records "${NS_KEY}" | grep -q "sample.txt"; then
     pass "the state record of the reaped file is pruned"
+else
+    fail "the state record of the reaped file is pruned"
 fi
 
-# --- state store -----------------------------------------------------------
+# --- state store ------------------------------------------------------------
 echo "==> state store"
 if [[ -f "${STATE_FILE}" ]]; then
     pass "the state file exists"
@@ -125,7 +177,7 @@ else
     fail "the state file exists"
 fi
 
-# --- result ----------------------------------------------------------------
+# --- result -----------------------------------------------------------------
 echo
 if [[ "${FAILURES}" -eq 0 ]]; then
     echo "smoke test passed"

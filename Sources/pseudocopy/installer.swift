@@ -86,29 +86,25 @@ func executablePath() -> String {
 /// `ThrottleInterval` is needed because launchd otherwise applies its
 /// default throttle of 10 seconds, which would stretch `StartInterval` of
 /// 5 seconds to an effective 10 second cycle.
-func launchAgentPlist(binaryPath: String, watchDir: String, ttl: TimeInterval, home: String) -> String {
-    return """
-    <?xml version="1.0" encoding="UTF-8"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0">
-    <dict>
-      <key>Label</key><string>\(Constants.agentLabel)</string>
-      <key>ProgramArguments</key>
-      <array>
-        <string>\(binaryPath)</string>
-        <string>run</string>
-        <string>--dir</string><string>\(watchDir)</string>
-        <string>--ttl</string><string>\(Int(ttl))</string>
-      </array>
-      <key>RunAtLoad</key><true/>
-      <key>StartInterval</key><integer>\(Int(Constants.cycleInterval))</integer>
-      <key>ThrottleInterval</key><integer>\(Int(Constants.cycleInterval))</integer>
-      <key>ProcessType</key><string>Interactive</string>
-      <key>StandardOutPath</key><string>\(home)/Library/Logs/pseudocopy.log</string>
-      <key>StandardErrorPath</key><string>\(home)/Library/Logs/pseudocopy.log</string>
-    </dict>
-    </plist>
-    """
+///
+/// The plist is serialised by Foundation instead of being written by hand,
+/// so that paths containing `&` or `<` cannot produce an invalid file.
+func launchAgentPlist(binaryPath: String, watchDir: String, ttl: TimeInterval, home: String) throws -> Data {
+    let plist: [String: Any] = [
+        "Label": Constants.agentLabel,
+        "ProgramArguments": [
+            binaryPath, "run",
+            "--dir", watchDir,
+            "--ttl", String(ttl),
+        ],
+        "RunAtLoad": true,
+        "StartInterval": Int(Constants.cycleInterval),
+        "ThrottleInterval": Int(Constants.cycleInterval),
+        "ProcessType": "Interactive",
+        "StandardOutPath": "\(home)/Library/Logs/pseudocopy.log",
+        "StandardErrorPath": "\(home)/Library/Logs/pseudocopy.log",
+    ]
+    return try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
 }
 
 // MARK: - Commands
@@ -123,18 +119,28 @@ func installAgent(config: Configuration) throws {
     try fileManager.createDirectory(at: AgentPaths.launchAgentsDirectory, withIntermediateDirectories: true)
     try fileManager.createDirectory(at: AgentPaths.logsDirectory, withIntermediateDirectories: true)
 
-    let plist = launchAgentPlist(
+    let plist = try launchAgentPlist(
         binaryPath: executablePath(),
         watchDir: config.watchDir.path,
         ttl: config.ttl,
         home: NSHomeDirectory()
     )
-    try plist.write(to: AgentPaths.plistURL, atomically: true, encoding: .utf8)
+    let previousPlist = try? Data(contentsOf: AgentPaths.plistURL)
+    try plist.write(to: AgentPaths.plistURL, options: [.atomic])
 
     // (Re-)install: bootout first, so that a changed plist takes effect.
     _ = Launchctl.run(["bootout", Launchctl.label])
     let result = Launchctl.run(["bootstrap", Launchctl.domain, AgentPaths.plistURL.path])
     guard result.status == 0 else {
+        // Roll back: a failed install must not leave the tool unloaded with a
+        // broken plist on disk.
+        if let previousPlist {
+            try? previousPlist.write(to: AgentPaths.plistURL, options: [.atomic])
+            _ = Launchctl.run(["bootstrap", Launchctl.domain, AgentPaths.plistURL.path])
+            Logger.log(.error, "agent", "could not load the LaunchAgent — the previous one was restored")
+        } else {
+            try? FileManager.default.removeItem(at: AgentPaths.plistURL)
+        }
         throw CLIError.usage("could not load the LaunchAgent: \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
     }
 
@@ -150,13 +156,22 @@ func installAgent(config: Configuration) throws {
 func uninstallAgent() throws {
     let result = Launchctl.run(["bootout", Launchctl.label])
     if result.status != 0 {
-        Logger.verboseLog(.info, "agent", "bootout: \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+        Logger.log(.info, "agent", "bootout: \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
     }
     if FileManager.default.fileExists(atPath: AgentPaths.plistURL.path) {
         try FileManager.default.removeItem(at: AgentPaths.plistURL)
     }
     print("uninstalled \(Constants.agentLabel)")
     print("  watch dir and state are kept")
+}
+
+/// Forces one cycle of the running agent right now (§5.3).
+func kickAgent() throws {
+    let result = Launchctl.run(["kickstart", Launchctl.label])
+    guard result.status == 0 else {
+        throw CLIError.usage("could not start a cycle: \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+    print("kicked \(Constants.agentLabel)")
 }
 
 /// Prints the agent status; exits 1 when the agent is not loaded (§5.3).

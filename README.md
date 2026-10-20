@@ -83,6 +83,7 @@ pseudocopy gen-tests <dir>     # write sample files for testing
 pseudocopy install             # write the LaunchAgent plist + launchctl bootstrap
 pseudocopy uninstall           # launchctl bootout + remove the plist
 pseudocopy status              # exit 0 if the agent is loaded, 1 otherwise
+pseudocopy kick                # force one cycle of the agent right now
 pseudocopy help                # usage
 ```
 
@@ -91,7 +92,8 @@ Global flags: `--dir <path>` (watch folder, default `~/Temp`), `--ttl <seconds>`
 permanently instead of using the Trash).
 
 Exit codes: `0` on success, `1` on a runtime error (the reason is written to
-stderr).
+stderr). Without a subcommand nothing happens — `pseudocopy` prints the usage
+instead of quietly starting a cycle.
 
 ## How it decides what to copy
 
@@ -105,8 +107,13 @@ Because of that second observation, a file appears on the clipboard roughly
 5–10 seconds after it was written: the agent checks every 5 seconds and
 needs two identical readings.
 
+An old file (one that was copied in with an older timestamp) is copied to the
+clipboard as well and then removed from the folder — you get the content and
+the folder stays clean.
+
 Ignored entirely: directories, symlinks, dotfiles and partial downloads
-(`.crdownload`, `.part`, `.download`, `.tmp`, `.partial`).
+(`.crdownload`, `.part`, `.download`, `.tmp`, `.partial`). A partial download
+is never copied and never reaped; remove it by hand when it is stale.
 
 ## Log
 
@@ -132,14 +139,19 @@ Add `--verbose` for a line per cycle (handy while developing with
   source to still exist.
 - Very large files are best kept out of this folder: everything is copied
   into the clipboard, which lives in RAM. Nothing breaks, it is just
-  wasteful.
+  wasteful. Images and PDFs are not copied when they are larger than
+  256 MB.
 - **Manual edits in `~/Temp` are silently deleted after an hour.**
 - Stale partial downloads (`.crdownload` and friends) are ignored by
   `pseudocopy` — they are never copied and never reaped. Remove them by
   hand.
 - The reaper uses the older of the creation and modification date, so a file
   that was moved into the folder keeps its original age and may disappear
-  right away.
+  right away. It is copied to the clipboard first, so you still get its
+  content.
+- A download that stalls for a full hour is treated like any other finished
+  file: it is copied to the clipboard and then removed. Use a longer `--ttl`
+  if you resume large downloads by hand.
 
 ## Development
 
@@ -149,10 +161,23 @@ swift build -c release      # release build
 Scripts/smoke.sh            # headless end-to-end test
 ```
 
-`Scripts/smoke.sh` builds the tool, runs a full cycle in a sandbox folder and
-checks clipping, reaping and the exclusion of partial downloads. It writes to
-the system pasteboard and restores the previous clipboard content when it
+`Scripts/smoke.sh` builds the tool, runs full cycles in a private sandbox
+folder and checks clipping, reaping, the exclusion rules (partial downloads,
+dotfiles, directories, symlinks) and the process lock. It writes to the
+system pasteboard and restores the previous clipboard content when it
 finishes.
 
 The implementation follows `PLAN.md`; the phase-by-phase build log is in the
 git history.
+
+### Internals
+
+- The state lives in `~/Library/Application Support/pseudocopy/state.json`
+  (mode 0600), one namespace per watch folder. It is written atomically and
+  only when something actually changed.
+- Cycles are serialised with an `flock` on `…/pseudocopy/lock`. The kernel
+  releases it when the process dies, so a lock left behind by a killed cycle
+  can never wedge the tool. The file contains the PID for diagnostics.
+- The agent runs with `StartInterval` **and** `ThrottleInterval` of 5
+  seconds: without the latter, launchd applies its default 10 second
+  throttle and the reaction time doubles.

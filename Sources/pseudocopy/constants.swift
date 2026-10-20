@@ -26,6 +26,9 @@ enum Constants {
 
     /// LaunchAgent plist name inside `~/Library/LaunchAgents`.
     static let plistFileName = "com.pseudocopy.plist"
+
+    /// Schema version of the state file.
+    static let stateVersion = 1
 }
 
 /// Event kinds used in the log format (§2.5).
@@ -73,13 +76,17 @@ enum Logger {
 enum ExtensionSets {
     /// Extensions treated as UTF-8 text. Anything that fails to decode as
     /// UTF-8 falls through to the generic *Other* representation.
+    ///
+    /// "rtf" is deliberately absent: RTF is not UTF-8 text, pasting it as
+    /// plain text would put the markup on the clipboard instead of the
+    /// document.
     static let text: Set<String> = [
         "txt", "text", "md", "markdown", "log", "csv", "tsv", "json", "jsonl",
         "yaml", "yml", "toml", "ini", "cfg", "conf", "plist", "xml", "html",
         "htm", "css", "scss", "sh", "bash", "zsh", "fish", "py", "rb", "php",
         "pl", "lua", "swift", "js", "mjs", "ts", "tsx", "jsx", "c", "h", "cc",
         "cpp", "hpp", "m", "mm", "java", "kt", "go", "rs", "sql", "diff",
-        "patch", "tex", "srt", "vtt", "env", "rtf", "ics", "srt",
+        "patch", "tex", "srt", "vtt", "ics", "rst", "adoc", "properties",
     ]
 
     /// Extensions treated as images.

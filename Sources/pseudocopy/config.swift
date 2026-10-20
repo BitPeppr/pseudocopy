@@ -15,7 +15,9 @@ struct Configuration {
 
     static var `default`: Configuration {
         Configuration(
-            watchDir: Configuration.resolvePath("~/Temp"),
+            watchDir: URL(fileURLWithPath: (NSHomeDirectory() as NSString).appendingPathComponent("Temp"))
+                .standardizedFileURL
+                .resolvingSymlinksInPath(),
             ttl: Constants.defaultTTL,
             embedLimitBytes: Constants.embedLimitBytes,
             verbose: false,
@@ -25,10 +27,13 @@ struct Configuration {
 
     /// Expands `~`, makes the path absolute and removes symlinks so that the
     /// same folder always maps to the same state namespace.
-    static func resolvePath(_ raw: String) -> URL {
+    ///
+    /// An empty path is rejected: it would silently watch the current working
+    /// directory, and the reaper would move *its* old files to the Trash.
+    static func resolvePath(_ raw: String) throws -> URL {
         let expanded = (raw as NSString).expandingTildeInPath
-        if expanded.isEmpty {
-            return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        guard !expanded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CLIError.usage("--dir must not be empty")
         }
         return URL(fileURLWithPath: expanded)
             .standardizedFileURL
@@ -47,7 +52,7 @@ struct Configuration {
             case "--dir":
                 index += 1
                 guard index < args.count else { throw CLIError.usage("missing value for --dir") }
-                config.watchDir = Configuration.resolvePath(args[index])
+                config.watchDir = try Configuration.resolvePath(args[index])
             case "--ttl":
                 index += 1
                 guard index < args.count else { throw CLIError.usage("missing value for --ttl") }
@@ -67,7 +72,7 @@ struct Configuration {
     }
 
     static func parseTTL(_ raw: String) throws -> TimeInterval {
-        guard let value = TimeInterval(raw), value >= 0 else {
+        guard let value = TimeInterval(raw), value.isFinite, value >= 0, value <= 100_000_000 else {
             throw CLIError.usage("invalid --ttl value '\(raw)' (expected a non-negative number of seconds)")
         }
         return value

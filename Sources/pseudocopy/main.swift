@@ -36,6 +36,8 @@ struct Pseudocopy {
             try uninstallAgent()
         case .status:
             try printAgentStatus()
+        case .kick:
+            try kickAgent()
         }
     }
 }
@@ -58,6 +60,7 @@ enum Command: String {
     case install
     case uninstall
     case status
+    case kick
     case help
 }
 
@@ -96,7 +99,7 @@ enum CLI {
                 ttl = try Configuration.parseTTL(raw)
                 globalFlags.append(contentsOf: ["--ttl", raw])
             case "--interval":
-                guard let raw = TimeInterval(try value(for: "--interval")), raw > 0 else {
+                guard let raw = parseInterval(try value(for: "--interval")) else {
                     throw CLIError.usage("invalid --interval value (expected a positive number of seconds)")
                 }
                 interval = raw
@@ -117,7 +120,7 @@ enum CLI {
                         ttl = try Configuration.parseTTL(value)
                         globalFlags.append(contentsOf: ["--ttl", value])
                     } else if let value = argValue(arg, prefix: "--interval=") {
-                        guard let raw = TimeInterval(value), raw > 0 else {
+                        guard let raw = parseInterval(value) else {
                             throw CLIError.usage("invalid --interval value (expected a positive number of seconds)")
                         }
                         interval = raw
@@ -139,7 +142,7 @@ enum CLI {
 
         var config = try Configuration.parse(globalFlags)
         if let watchDir = watchDir {
-            config.watchDir = Configuration.resolvePath(watchDir)
+            config.watchDir = try Configuration.resolvePath(watchDir)
         }
         if let ttl = ttl {
             config.ttl = ttl
@@ -148,7 +151,9 @@ enum CLI {
         config.permanent = permanent || config.permanent
 
         return Invocation(
-            command: command ?? .run,
+            // Without a subcommand nothing happens — a bare `pseudocopy` must
+            // not silently start a real cycle against ~/Temp.
+            command: command ?? .help,
             config: config,
             positional: positional,
             interval: interval ?? Constants.cycleInterval
@@ -158,6 +163,13 @@ enum CLI {
     private static func argValue(_ arg: String, prefix: String) -> String? {
         guard arg.hasPrefix(prefix) else { return nil }
         return String(arg.dropFirst(prefix.count))
+    }
+
+    /// Parses a cycle interval. `inf` and other absurd values are rejected
+    /// instead of trapping later on.
+    static func parseInterval(_ raw: String) -> TimeInterval? {
+        guard let value = TimeInterval(raw), value.isFinite, value > 0, value <= 86_400 else { return nil }
+        return value
     }
 
     static func printUsage() {
@@ -173,6 +185,7 @@ enum CLI {
           pseudocopy install             # write LaunchAgent plist + launchctl bootstrap
           pseudocopy uninstall           # launchctl bootout + remove plist
           pseudocopy status              # exit 0 if agent is loaded, 1 otherwise
+          pseudocopy kick                # force one cycle of the agent right now
           pseudocopy help                # usage
 
         GLOBAL FLAGS:

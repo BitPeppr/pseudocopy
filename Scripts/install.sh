@@ -45,8 +45,10 @@ cp -f "${ROOT_DIR}/.build/release/pseudocopy" "${PREFIX}/pseudocopy"
 chmod 755 "${PREFIX}/pseudocopy"
 
 echo "==> preparing watch dir ${WATCHDIR}"
-mkdir -p "${WATCHDIR}"
-chmod 700 "${WATCHDIR}"
+if [[ ! -d "${WATCHDIR}" ]]; then
+    mkdir -p "${WATCHDIR}"
+    chmod 700 "${WATCHDIR}"
+fi
 
 INSTALL_ARGS=(install --dir "${WATCHDIR}")
 if [[ -n "${TTL}" ]]; then
