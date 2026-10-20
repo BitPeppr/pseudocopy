@@ -43,6 +43,10 @@ mkdir -p ~/bin && cp .build/release/pseudocopy ~/bin/
 ~/bin/pseudocopy install --dir ~/Temp
 ```
 
+The TTL is written into the agent's plist when it is installed, so changing
+it later means re-running `pseudocopy install`. The same is true for the
+watch folder — the agent always watches the directory it was installed with.
+
 ## Uninstall
 
 ```sh
