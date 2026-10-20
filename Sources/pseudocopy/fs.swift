@@ -33,20 +33,20 @@ enum FileVerification {
 
 /// One watch + reap cycle.
 func runCycle(config: Configuration) throws {
-    print("not implemented")
+    CLI.fail("run is not implemented yet")
 }
 
 /// Resident loop, for foreground development only.
 func runLoop(config: Configuration, interval: TimeInterval) throws {
-    print("not implemented")
+    CLI.fail("loop is not implemented yet")
 }
 
 /// Force-reap everything older than the TTL right now.
 func runClean(config: Configuration) throws {
-    print("not implemented")
+    CLI.fail("clean is not implemented yet")
 }
 
 /// Clip files manually, bypassing the settle logic.
 func clipPaths(_ paths: [String], config: Configuration) throws {
-    print("not implemented")
+    CLI.fail("clip is not implemented yet")
 }

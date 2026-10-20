@@ -4,15 +4,15 @@ import Foundation
 
 /// Writes the LaunchAgent plist and bootstraps the agent.
 func installAgent(config: Configuration) throws {
-    print("not implemented")
+    CLI.fail("install is not implemented yet")
 }
 
 /// Removes the LaunchAgent and its plist.
 func uninstallAgent() throws {
-    print("not implemented")
+    CLI.fail("uninstall is not implemented yet")
 }
 
 /// Prints the agent status; exits 1 when the agent is not loaded.
 func printAgentStatus() throws {
-    print("not implemented")
+    CLI.fail("status is not implemented yet")
 }

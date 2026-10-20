@@ -6,5 +6,5 @@ import Foundation
 func generateTestFiles(_ paths: [String]) throws {
     let dir = URL(fileURLWithPath: paths.first ?? "./")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    print("not implemented")
+    CLI.fail("gen-tests is not implemented yet")
 }

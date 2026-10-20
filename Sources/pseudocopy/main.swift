@@ -118,6 +118,8 @@ enum CLI {
                     throw CLIError.usage("unknown option '\(arg)'")
                 } else if command == nil, let parsed = Command(rawValue: arg) {
                     command = parsed
+                } else if command == nil {
+                    throw CLIError.usage("unknown subcommand '\(arg)' (try 'pseudocopy help')")
                 } else {
                     positional.append(arg)
                 }
