@@ -29,7 +29,9 @@ brew services start pseudocopy
 The formula installs the universal binary and a LaunchAgent that runs
 `pseudocopy run` every five seconds. It watches `~/Temp`; use the source
 install below if you want another folder or a different TTL. Do **not** run
-`pseudocopy install` as well — that would register a second agent.
+`pseudocopy install` as well — it refuses while the Homebrew service is
+loaded. `pseudocopy status` and `pseudocopy kick` work with the Homebrew
+service; use `brew services` to start, stop, or restart it.
 
 ### From source
 
