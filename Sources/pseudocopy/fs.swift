@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 // PLAN.md §3: fs.swift holds the filesystem core and stays free of AppKit
@@ -118,6 +119,85 @@ func displayPath(_ url: URL) -> String {
     return path
 }
 
+// MARK: - Process lock (§2.6)
+
+/// A PID based lock file that keeps two cycles from overlapping.
+///
+/// The lock file contains the PID of the owning process. When the file
+/// exists, the PID is checked with `kill(pid, 0)`: a live owner means another
+/// cycle is running, a dead owner means the lock is stale and can be taken
+/// over.
+final class ProcessLock {
+    private let url: URL
+    private var descriptor: Int32 = -1
+    private var ownsLock = false
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    /// Tries to take the lock. Returns false when another process holds it.
+    func acquire() -> Bool {
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        if createLockFile() {
+            ownsLock = true
+            return true
+        }
+
+        if let pid = readPID(), pid != getpid(), isAlive(pid) {
+            // Another cycle is still running.
+            return false
+        }
+
+        // Stale lock (or our own leftover): remove it and try once more.
+        try? FileManager.default.removeItem(at: url)
+        if createLockFile() {
+            ownsLock = true
+            return true
+        }
+        return false
+    }
+
+    /// Removes the lock file again.
+    func release() {
+        guard ownsLock else { return }
+        ownsLock = false
+        if descriptor >= 0 {
+            close(descriptor)
+            descriptor = -1
+        }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func createLockFile() -> Bool {
+        let handle = open(url.path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
+        guard handle >= 0 else { return false }
+        let pid = "\(getpid())\n"
+        _ = pid.withCString { pointer in
+            write(handle, pointer, strlen(pointer))
+        }
+        descriptor = handle
+        return true
+    }
+
+    private func readPID() -> pid_t? {
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
+        let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let text = text, let value = Int(text), value > 0 else { return nil }
+        return pid_t(value)
+    }
+
+    private func isAlive(_ pid: pid_t) -> Bool {
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+}
+
 // MARK: - Cycle
 
 /// Scans the watch directory and classifies every top level entry.
@@ -176,6 +256,15 @@ private func performCycle(config: Configuration, clipping: Bool) throws {
 
     var store = StateStore(watchDir: config.watchDir)
     store.load()
+
+    // Guard against overlapping invocations (§2.6): launchd starts a new
+    // cycle every 5 seconds, a slow cycle (a 64 MB embed) could still run.
+    let lock = ProcessLock(url: store.lockFileURL)
+    guard lock.acquire() else {
+        Logger.verboseLog(.cycle, "lock", "another cycle is running — skipping")
+        return
+    }
+    defer { lock.release() }
 
     let previous = store.lastScan
     var records = store.records
