@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [semantic versioning](https://semver.org/).
 
+## [1.0.4] — 2026-10-20
+
+### Fixed
+
+- The warning about a leftover Homebrew plist only appears when the built-in
+  agent exists as well. A Homebrew plist on its own is the normal case for
+  `brew services` users and was a false alarm.
+
 ## [1.0.3] — 2026-10-20
 
 ### Added

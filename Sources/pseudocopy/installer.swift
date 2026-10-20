@@ -359,11 +359,15 @@ func printWarnings(config: Configuration) {
 
     // A Homebrew service that is not running but whose plist is still on disk
     // would come back the next time the user runs 'brew services start' and
-    // put a second agent next to this one.
-    for name in Constants.homebrewAgentLabels {
-        let plist = AgentPaths.launchAgentsDirectory.appendingPathComponent("\(name).plist")
-        guard FileManager.default.fileExists(atPath: plist.path) else { continue }
-        print("warning: \(plist.path) still exists — 'brew services start pseudocopy' would load a second agent")
+    // put a second agent next to this one. That is only a problem when the
+    // built-in agent exists as well — a Homebrew plist on its own is normal.
+    if FileManager.default.fileExists(atPath: AgentPaths.plistURL.path) {
+        for name in Constants.homebrewAgentLabels {
+            let plist = AgentPaths.launchAgentsDirectory.appendingPathComponent("\(name).plist")
+            guard FileManager.default.fileExists(atPath: plist.path) else { continue }
+            print("warning: \(plist.path) still exists — 'brew services start pseudocopy' "
+                  + "would load a second agent next to \(Constants.agentLabel)")
+        }
     }
 }
 

@@ -4,7 +4,7 @@ import Foundation
 enum Constants {
     /// The released version. `Scripts/release.sh` reads this value and
     /// refuses to publish a tag that does not match it.
-    static let version = "1.0.3"
+    static let version = "1.0.4"
 
     /// Seconds between cycles when running in resident `loop` mode.
     /// The LaunchAgent uses the same value as its `StartInterval`.
