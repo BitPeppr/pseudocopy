@@ -2,6 +2,10 @@ import Foundation
 
 /// Timing and sizing constants (§2.4).
 enum Constants {
+    /// The released version. `Scripts/release.sh` reads this value and
+    /// refuses to publish a tag that does not match it.
+    static let version = "1.0.0"
+
     /// Seconds between cycles when running in resident `loop` mode.
     /// The LaunchAgent uses the same value as its `StartInterval`.
     static let cycleInterval: TimeInterval = 5

@@ -6,8 +6,7 @@ and moves files that are older than an hour to the **Trash**.
 
 It is a single Swift executable driven by a `launchd` LaunchAgent: every five
 seconds it wakes up, does one cycle and exits again. No menu bar icon, no
-background daemon, no Homebrew, no third-party dependencies — AppKit and
-Foundation only.
+background daemon, no third-party dependencies — AppKit and Foundation only.
 
 ```
 ~/Temp/notes.txt   ->  clipboard (plain text)
@@ -18,8 +17,22 @@ Foundation only.
 
 ## Install
 
+### Homebrew (recommended)
+
 ```sh
-git clone <this repo> pseudocopy
+brew install BitPeppr/tap/pseudocopy
+brew services start pseudocopy
+```
+
+The formula installs the universal binary and a LaunchAgent that runs
+`pseudocopy run` every five seconds. It watches `~/Temp`; use the source
+install below if you want another folder or a different TTL. Do **not** run
+`pseudocopy install` as well — that would register a second agent.
+
+### From source
+
+```sh
+git clone https://github.com/BitPeppr/pseudocopy.git
 cd pseudocopy
 Scripts/install.sh
 ```
@@ -88,6 +101,7 @@ pseudocopy install             # write the LaunchAgent plist + launchctl bootstr
 pseudocopy uninstall           # launchctl bootout + remove the plist
 pseudocopy status              # exit 0 if the agent is loaded, 1 otherwise
 pseudocopy kick                # force one cycle of the agent right now
+pseudocopy version             # print the version
 pseudocopy help                # usage
 ```
 
@@ -180,6 +194,7 @@ Add `--verbose` for a line per cycle (handy while developing with
 swift build                 # debug build
 swift build -c release      # release build
 Scripts/smoke.sh            # headless end-to-end test
+Scripts/release.sh          # universal binary + GitHub release (maintainers)
 ```
 
 `Scripts/smoke.sh` builds the tool, runs full cycles in a private sandbox
@@ -187,6 +202,9 @@ folder and checks clipping, reaping, the exclusion rules (partial downloads,
 dotfiles, directories, symlinks) and the process lock. It writes to the
 system pasteboard and restores the previous clipboard content when it
 finishes.
+
+Packaging — the Homebrew tap, the release tarball and why there is no DMG —
+is described in [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md).
 
 The implementation follows `PLAN.md`; the phase-by-phase build log is in the
 git history.

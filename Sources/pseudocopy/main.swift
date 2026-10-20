@@ -38,6 +38,8 @@ struct Pseudocopy {
             try printAgentStatus()
         case .kick:
             try kickAgent()
+        case .version:
+            print("pseudocopy \(Constants.version)")
         }
     }
 }
@@ -61,6 +63,7 @@ enum Command: String {
     case uninstall
     case status
     case kick
+    case version
     case help
 }
 
@@ -111,6 +114,8 @@ enum CLI {
                 globalFlags.append(arg)
             case "-h", "--help":
                 command = .help
+            case "-V", "--version":
+                command = .version
             default:
                 if arg.hasPrefix("--") {
                     if let value = argValue(arg, prefix: "--dir=") {
@@ -186,6 +191,7 @@ enum CLI {
           pseudocopy uninstall           # launchctl bootout + remove plist
           pseudocopy status              # exit 0 if agent is loaded, 1 otherwise
           pseudocopy kick                # force one cycle of the agent right now
+          pseudocopy version             # print the version
           pseudocopy help                # usage
 
         GLOBAL FLAGS:

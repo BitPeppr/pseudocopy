@@ -1,0 +1,45 @@
+class Pseudocopy < Formula
+  desc "Copy every new file in a folder to the clipboard and reap old ones"
+  homepage "https://github.com/BitPeppr/pseudocopy"
+  url "https://github.com/BitPeppr/pseudocopy/releases/download/v__VERSION__/pseudocopy-__VERSION__-macos-universal.tar.gz"
+  sha256 "__SHA256__"
+  license "MIT"
+
+  depends_on macos: :ventura
+
+  def install
+    bin.install "pseudocopy"
+  end
+
+  service do
+    run [opt_bin/"pseudocopy", "run"]
+    run_type :interval
+    interval 5
+    throttle_interval 5
+    process_type :background
+    log_path "#{Dir.home}/Library/Logs/pseudocopy.log"
+    error_log_path "#{Dir.home}/Library/Logs/pseudocopy.log"
+  end
+
+  def caveats
+    <<~EOS
+      Start the watcher with:
+        brew services start pseudocopy
+
+      It copies every settled file in ~/Temp to the clipboard and moves files
+      older than an hour to the Trash. Do not also run `pseudocopy install`:
+      that would register a second agent.
+
+      The service watches ~/Temp. To watch another folder (or change the TTL),
+      remove the service and install the agent from source instead:
+        brew services stop pseudocopy
+        pseudocopy install --dir ~/Downloads --ttl 600
+    EOS
+  end
+
+  test do
+    system bin/"pseudocopy", "gen-tests", testpath
+    assert_predicate testpath/"sample.txt", :exist?
+    assert_match "pseudocopy #{version}", shell_output("#{bin}/pseudocopy version")
+  end
+end

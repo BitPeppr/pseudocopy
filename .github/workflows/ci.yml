@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (debug)
+        run: swift build
+      - name: Build (release)
+        run: swift build -c release
+      - name: Version and usage
+        run: |
+          .build/release/pseudocopy version
+          .build/release/pseudocopy help > /dev/null
+      - name: Sample files
+        run: |
+          DIR="$(mktemp -d)"
+          .build/release/pseudocopy gen-tests "$DIR" > /dev/null
+          test "$(find "$DIR" -type f | wc -l | tr -d ' ')" = "8"
+
+  cross-compile:
+    name: Cross-compile (x86_64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift build -c release --arch x86_64
+      - run: lipo -info .build/x86_64-apple-macosx/release/pseudocopy
