@@ -174,8 +174,14 @@ func runCycle(config: Configuration) throws {
         }
 
         let kind = classifyFile(entry.url)
-        // The pasteboard writer is wired in Phase 4.
-        Logger.log(.clip, kind.rawValue, displayPath(entry.url))
+        let written: FileKind
+        do {
+            written = try putOnClipboard(kind: kind, url: entry.url, embedLimit: config.embedLimitBytes)
+        } catch {
+            Logger.log(.error, "clip", "\(displayPath(entry.url)): \(error.localizedDescription)")
+            continue
+        }
+        Logger.log(.clip, written.rawValue, displayPath(entry.url))
 
         var record = records[entry.path] ?? StateRecord(lastFingerprint: current, clippedFingerprint: nil)
         record.lastFingerprint = current
@@ -240,5 +246,19 @@ func runClean(config: Configuration) throws {
 
 /// Clip files manually, bypassing the settle logic (§2.7).
 func clipPaths(_ paths: [String], config: Configuration) throws {
-    CLI.fail("clip is not implemented yet")
+    guard !paths.isEmpty else {
+        throw CLIError.usage("clip needs at least one file path")
+    }
+    for path in paths {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            throw CLIError.usage("not a file: \(path)")
+        }
+        let kind = classifyFile(url)
+        let written = try putOnClipboard(kind: kind, url: url, embedLimit: config.embedLimitBytes)
+        Logger.log(.clip, written.rawValue, displayPath(url))
+    }
 }

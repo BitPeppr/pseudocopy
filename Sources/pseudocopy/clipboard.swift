@@ -11,7 +11,10 @@ import UniformTypeIdentifiers
 ///   - kind: how the file should be represented.
 ///   - url: the file to clip.
 ///   - embedLimit: maximum size for which the raw bytes are embedded.
-func putOnClipboard(kind: FileKind, url: URL, embedLimit: Int) throws {
+/// - Returns: the kind that was actually written — text files that are not
+///   valid UTF-8 fall through to `.other`.
+@discardableResult
+func putOnClipboard(kind: FileKind, url: URL, embedLimit: Int) throws -> FileKind {
     let pasteboard = NSPasteboard.general
 
     switch kind {
@@ -19,17 +22,18 @@ func putOnClipboard(kind: FileKind, url: URL, embedLimit: Int) throws {
         // Text that is not valid UTF-8 falls through to the generic handling.
         guard let text = try? String(contentsOf: url, encoding: .utf8),
               let data = text.data(using: .utf8) else {
-            try putOnClipboard(kind: .other, url: url, embedLimit: embedLimit)
-            return
+            return try putOnClipboard(kind: .other, url: url, embedLimit: embedLimit)
         }
         pasteboard.clearContents()
         pasteboard.setData(data, forType: NSPasteboard.PasteboardType("public.utf8-plain-text"))
+        return .text
 
     case .image, .pdf:
         let raw = try Data(contentsOf: url)
         let uti = UTType(filenameExtension: url.pathExtension)?.identifier ?? UTType.data.identifier
         pasteboard.clearContents()
         pasteboard.setData(raw, forType: NSPasteboard.PasteboardType(uti))
+        return kind
 
     case .other:
         let raw = try Data(contentsOf: url)
@@ -44,5 +48,6 @@ func putOnClipboard(kind: FileKind, url: URL, embedLimit: Int) throws {
         if size <= embedLimit {
             pasteboard.setData(raw, forType: NSPasteboard.PasteboardType(uti))
         }
+        return .other
     }
 }
