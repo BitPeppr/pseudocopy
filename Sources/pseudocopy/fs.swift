@@ -45,14 +45,9 @@ struct ScanEntry {
 
 // MARK: - Classification
 
-/// Classifies a file by extension, case-insensitively (§2.2).
-func classifyFile(_ url: URL) -> FileKind {
-    let ext = url.pathExtension.lowercased()
-    if ExtensionSets.text.contains(ext) { return .text }
-    if ExtensionSets.image.contains(ext) { return .image }
-    if ExtensionSets.pdf.contains(ext) { return .pdf }
-    return .other
-}
+// `classifyFile` lives in filetype.swift: a file is identified from its
+// content (PDF header, ImageIO, UTF-8 heuristic) and only falls back to its
+// extension. This file stays free of the pasteboard frameworks.
 
 /// True when the file name carries a partial-download marker (§2.1).
 func partialFileExtension(_ name: String) -> Bool {
@@ -475,7 +470,6 @@ private func performCycle(config: Configuration, clipping: Bool, force: Bool) th
             if !candidates.isEmpty {
                 do {
                     let batch = try putFilesOnClipboardBestEffort(
-                        kinds: candidates.map { classifyFile($0.entry.url) },
                         urls: candidates.map { $0.entry.url },
                         limits: ClipLimits(
                             text: config.textLimitBytes,
@@ -638,7 +632,6 @@ func clipPaths(_ paths: [String], config: Configuration) throws {
     }
 
     var urls: [URL] = []
-    var kinds: [FileKind] = []
     var failures = 0
     for path in paths {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
@@ -652,7 +645,6 @@ func clipPaths(_ paths: [String], config: Configuration) throws {
             continue
         }
         urls.append(url)
-        kinds.append(classifyFile(url))
     }
     guard !urls.isEmpty else {
         throw CLIError.usage("none of the given paths is a file")
@@ -660,7 +652,7 @@ func clipPaths(_ paths: [String], config: Configuration) throws {
 
     // One transaction for all files: a pasteboard holds one value per type,
     // but every file is offered as a file reference.
-    let written = try putFilesOnClipboard(kinds: kinds, urls: urls, limits: ClipLimits(
+    let written = try putFilesOnClipboard(urls: urls, limits: ClipLimits(
         text: config.textLimitBytes,
         embed: config.embedLimitBytes,
         materialise: config.materialiseLimitBytes

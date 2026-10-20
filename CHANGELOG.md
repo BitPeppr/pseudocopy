@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [semantic versioning](https://semver.org/).
 
+## [1.1.0] — 2026-10-21
+
+### Fixed
+
+- **A multi-page PDF no longer loses its pages.** The whole document was
+  already on the pasteboard, but macOS rasterises a PDF to **the first page**
+  when an app asks for an image (chat, mail, notes, upload fields), and the
+  other pages disappeared without a word. A PDF now also carries a file
+  reference, so file-aware apps receive the complete document, and a PDF
+  with more than one page logs a warning. Pasting into a PDF-aware app
+  (Preview, Pages, Word) still inserts every page.
+- **Text is visible to modern apps.** The pasteboard used to carry only the
+  legacy `public.utf8-plain-text`; apps that ask for `public.plain-text`
+  (the modern `UTType.plainText`) saw an empty pasteboard. Both are written
+  now.
+- **The file type is read from the content, not the name.** A PNG named
+  `.jpg` is advertised as `public.png`, and `.webp`, `.bmp`, `.avif` and the
+  like are treated as images instead of being offered as files. Every format
+  ImageIO can decode now behaves exactly like `.png`.
+- **Extensionless text files are pasted as text.** `Dockerfile`, `Makefile`
+  and `LICENSE` used to land as file references; a file whose extension says
+  nothing is now pasted as text when its bytes are valid UTF-8 without NUL
+  bytes.
+
+### Changed
+
+- A PDF clip carries `public.file-url` next to `com.adobe.pdf`; a single
+  text or image clip still carries no file reference.
+- The README documents the representation of every type, the PDF page
+  caveat, and the deliberate deviations from `PLAN.md` §2.2.
+
+### Added
+
+- The smoke test compiles a small pasteboard inspector and asserts the exact
+  representation set for text, images (including mislabelled ones), a
+  multi-page PDF, extensionless text and a binary file. It snapshots and
+  restores the *whole* clipboard instead of only its text.
+
 ## [1.0.4] — 2026-10-20
 
 ### Fixed

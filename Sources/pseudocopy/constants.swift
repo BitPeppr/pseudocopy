@@ -4,7 +4,7 @@ import Foundation
 enum Constants {
     /// The released version. `Scripts/release.sh` reads this value and
     /// refuses to publish a tag that does not match it.
-    static let version = "1.0.4"
+    static let version = "1.1.0"
 
     /// Seconds between cycles when running in resident `loop` mode.
     /// The LaunchAgent uses the same value as its `StartInterval`.
@@ -109,6 +109,11 @@ enum Logger {
 }
 
 /// Extension sets used for "smart by type" classification (§2.2).
+///
+/// The content is inspected first (`inspectFile`): a file whose bytes are
+/// identifiable is classified by what it is, not by what it is called. These
+/// lists are the fallback for files that cannot be identified, and they decide
+/// which extensions are text without having to read the whole file.
 enum ExtensionSets {
     /// Extensions treated as UTF-8 text. Anything that fails to decode as
     /// UTF-8 falls through to the generic *Other* representation.

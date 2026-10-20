@@ -7,8 +7,9 @@
 # touched. Checks clipping, reaping, the exclusion rules, the process lock, the
 # state store and the safety paths (unreadable files, corrupt state, guards).
 #
-# NOTE: this test writes to the system pasteboard. The previous (text) content
-#       is restored when the script finishes.
+# NOTE: this test writes to the system pasteboard. The whole clipboard (every
+#       representation, not just the text) is snapshotted first and restored
+#       when the script finishes.
 #
 set -uo pipefail
 
@@ -82,18 +83,35 @@ sys.exit(0 if sys.argv[2] in data.get("dirs", {}) else 1)
 PY
 }
 
-# --- clipboard backup ------------------------------------------------------
-CLIP_BACKUP="${LOG_DIR}/clipboard.txt"
-if pbpaste > "${CLIP_BACKUP}" 2>/dev/null; then
-    info "the clipboard is restored when the test finishes (text content only)"
-else
-    : > "${CLIP_BACKUP}"
-fi
+# --- clipboard inspector + backup ------------------------------------------
+# `pbpaste` only sees text; the inspector reads every representation, so the
+# test can assert what apps actually receive.
+INSPECTOR="${LOG_DIR}/pasteboard-inspector"
+CLIP_SNAPSHOT="${LOG_DIR}/clipboard.plist"
+
 cleanup() {
-    pbcopy < "${CLIP_BACKUP}" 2>/dev/null || true
+    if [[ -x "${INSPECTOR}" && -f "${CLIP_SNAPSHOT}" ]]; then
+        "${INSPECTOR}" restore "${CLIP_SNAPSHOT}" >/dev/null 2>&1 || true
+    fi
     rm -rf "${LOG_DIR}" "${SANDBOX}" "${RESET_SANDBOX}" "${CORRUPT_SANDBOX}"
 }
 trap cleanup EXIT
+
+if ! swiftc -O -o "${INSPECTOR}" "${SCRIPT_DIR}/pasteboard_inspector.swift" > "${LOG_DIR}/inspector.log" 2>&1; then
+    echo "the pasteboard inspector failed to build:" >&2
+    cat "${LOG_DIR}/inspector.log" >&2
+    exit 1
+fi
+if "${INSPECTOR}" save "${CLIP_SNAPSHOT}" 2>/dev/null; then
+    info "the clipboard is restored when the test finishes"
+else
+    fail "the clipboard could not be saved"
+fi
+
+pb_has() { "${INSPECTOR}" has "$1"; }
+pb_size() { "${INSPECTOR}" size "$1"; }
+pb_string() { "${INSPECTOR}" string "$1"; }
+pb_file_urls() { "${INSPECTOR}" file-urls; }
 
 # --- build -----------------------------------------------------------------
 echo "==> building"
@@ -514,6 +532,120 @@ if [[ ! -e "${VOLUME_TEST}" ]]; then
     pass "the refused volume path is not created"
 else
     fail "the refused volume path is not created"
+fi
+
+# --- the pasteboard representation of every file type ----------------------
+echo "==> clipboard representations"
+TYPES="${LOG_DIR}/types"
+mkdir -p "${TYPES}"
+if python3 - "${TYPES}" <<'PY'
+import base64, pathlib, sys
+
+root = pathlib.Path(sys.argv[1])
+png = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+(root / "pixel.png").write_bytes(png)
+(root / "mislabelled.jpg").write_bytes(png)   # PNG bytes, .jpg name
+(root / "photo.webp").write_bytes(png)        # PNG bytes, .webp name
+(root / "notes.txt").write_text("first line\nsecond line\n")
+(root / "Dockerfile").write_text("FROM alpine\nRUN echo hi\n")
+(root / "payload.bin").write_bytes(b"binary\x00data\x01\x02")
+
+objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 5 0 R >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 6 0 R >>",
+    "<< /Length 0 >>\nstream\n\nendstream",
+    "<< /Length 0 >>\nstream\n\nendstream",
+]
+pdf = "%PDF-1.4\n"
+offsets = []
+for index, body in enumerate(objects):
+    offsets.append(len(pdf.encode()))
+    pdf += f"{index + 1} 0 obj\n{body}\nendobj\n"
+start = len(pdf.encode())
+pdf += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n"
+for offset in offsets:
+    pdf += f"{offset:010d} 00000 n \n"
+pdf += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n"
+(root / "two-pages.pdf").write_bytes(pdf.encode())
+PY
+then
+    pass "the type fixtures are written"
+else
+    fail "the type fixtures are written"
+fi
+
+# A PDF keeps all pages as document data, and carries the file itself so a
+# target that cannot take PDF data still gets the whole document.
+"${BIN}" clip "${TYPES}/two-pages.pdf" > "${LOG_DIR}/clip-pdf.log" 2>&1
+STATUS=$?
+check_eq "a PDF clip exits 0" "0" "${STATUS}"
+check_eq "the whole PDF is on the pasteboard" "$(stat -f %z "${TYPES}/two-pages.pdf")" "$(pb_size com.adobe.pdf)"
+if pb_file_urls | grep -q "two-pages.pdf"; then
+    pass "a PDF carries a file reference for file-aware apps"
+else
+    fail "a PDF carries a file reference for file-aware apps"
+fi
+if grep -q "has 2 pages" "${LOG_DIR}/clip-pdf.log"; then
+    pass "the multi-page warning is logged"
+else
+    fail "the multi-page warning is logged"
+fi
+
+# Text must be visible to both the legacy and the modern pasteboard clients.
+"${BIN}" clip "${TYPES}/notes.txt" >/dev/null 2>&1
+if pb_has public.utf8-plain-text; then
+    pass "text is offered as UTF-8"
+else
+    fail "text is offered as UTF-8"
+fi
+if pb_has public.plain-text; then
+    pass "text is offered under the modern UTI"
+else
+    fail "text is offered under the modern UTI"
+fi
+check_eq "the text is unchanged" "first line" "$(pb_string public.plain-text | head -1)"
+if pb_has public.file-url; then
+    fail "a single text clip carries no file reference"
+else
+    pass "a single text clip carries no file reference"
+fi
+
+# The bytes decide the type, not the name.
+"${BIN}" clip "${TYPES}/mislabelled.jpg" >/dev/null 2>&1
+check_eq "a PNG named .jpg is advertised as PNG" "70" "$(pb_size public.png)"
+if pb_has public.jpeg; then
+    fail "a PNG named .jpg is not advertised as JPEG"
+else
+    pass "a PNG named .jpg is not advertised as JPEG"
+fi
+
+"${BIN}" clip "${TYPES}/photo.webp" >/dev/null 2>&1
+check_eq "a PNG named .webp is advertised as PNG" "70" "$(pb_size public.png)"
+if pb_has public.file-url; then
+    fail "an image outside the old extension list is not a file reference"
+else
+    pass "an image outside the old extension list is not a file reference"
+fi
+
+# A file with no extension is text when its bytes are text…
+"${BIN}" clip "${TYPES}/Dockerfile" >/dev/null 2>&1
+check_eq "an extensionless text file is pasted as text" "FROM alpine" "$(pb_string public.plain-text | head -1)"
+
+# …and stays a file when its bytes are binary.
+"${BIN}" clip "${TYPES}/payload.bin" >/dev/null 2>&1
+if pb_file_urls | grep -q "payload.bin"; then
+    pass "an extensionless binary file carries a file reference"
+else
+    fail "an extensionless binary file carries a file reference"
+fi
+if pb_has public.utf8-plain-text; then
+    fail "an extensionless binary file is not pasted as text"
+else
+    pass "an extensionless binary file is not pasted as text"
 fi
 
 # --- result -----------------------------------------------------------------

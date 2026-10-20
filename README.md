@@ -8,12 +8,14 @@ and moves files that are older than an hour to the **Trash**.
 
 It is a single Swift executable driven by a `launchd` LaunchAgent: every five
 seconds it wakes up, does one cycle and exits again. No menu bar icon, no
-background daemon, no third-party dependencies — AppKit and Foundation only.
+background daemon, no third-party dependencies — only Apple's system
+frameworks (AppKit, Foundation, CoreGraphics, ImageIO and
+UniformTypeIdentifiers).
 
 ```
 ~/Temp/notes.txt   ->  clipboard (plain text)
 ~/Temp/photo.png   ->  clipboard (image data)
-~/Temp/paper.pdf   ->  clipboard (PDF data)
+~/Temp/paper.pdf   ->  clipboard (whole PDF + file reference)
 ~/Temp/archive.zip ->  clipboard (file reference + embedded bytes)
 ```
 
@@ -94,11 +96,14 @@ The same works for anything else that writes into the folder — screenshots,
 `curl -O`, a drag-and-drop from the Finder.
 
 Text, images and PDFs are embedded in the pasteboard, so they survive the
-file being deleted an hour later. A single text/image/PDF clip carries only
-its native representation. Anything else is pasted as a file reference (so
-Finder creates a copy) plus, for files up to 64 MB, the raw bytes. A
-multi-file batch adds file references for every file so the Finder can copy
-them all.
+file being deleted an hour later. Text is pasted as text, an image as the
+image (the type is read from the bytes, not the name) and a PDF as the whole
+document. A PDF also carries a file reference — the complete file for apps
+that cannot take PDF data — and a multi-page PDF logs a warning, because
+macOS itself rasterises only the first page when a target asks for an image.
+Anything else is pasted as a file reference (so Finder creates a copy) plus,
+for files up to 64 MB, the raw bytes. A multi-file batch adds file references
+for every file so the Finder can copy them all.
 
 > **Use a dedicated folder.** Everything in the *top level* of the watch
 > folder is subject to the one hour reaper — do not point `pseudocopy` at a
@@ -210,6 +215,28 @@ Because of that second observation, a file appears on the clipboard roughly
 5–10 seconds after it was written: the agent checks every 5 seconds and
 needs two identical readings.
 
+### What lands on the clipboard
+
+| File | Pasteboard representation |
+|---|---|
+| **Text** — the extension list, or a file with no meaningful extension whose bytes are UTF-8 | the text, under both `public.utf8-plain-text` and `public.plain-text` |
+| **Image** — whatever ImageIO can decode (PNG, JPEG, GIF, TIFF, HEIC, WebP, BMP, AVIF, …) | the image bytes, under the type the *content* is; AppKit adds a TIFF for older apps |
+| **PDF** | the whole document under `com.adobe.pdf`, plus a `public.file-url` for apps that cannot take PDF data |
+| **Other** | `public.file-url` (plus the legacy Finder file list) and, up to 64 MB, the raw bytes under the file's UTI |
+
+The content wins over the name: a PNG called `.jpg` is advertised as
+`public.png`, and a WebP download is pasted as an image, not as a file. A
+binary file is never pasted as text — a NUL byte rules it out — and a file
+with no extension is pasted as text only when its bytes are valid UTF-8
+(`Dockerfile`, `Makefile`, `LICENSE`).
+
+A PDF is the one case where the format itself limits what an app can show:
+macOS rasterises a PDF to a single image when the target cannot take PDF
+data, and that image is always page 1. Pseudocopy keeps every page in the
+PDF representation, offers the file itself as a second representation, and
+logs a warning for a document with more than one page. To get all pages,
+paste into a PDF-aware app (Preview, Pages, Word) or as a file.
+
 An old file that arrives after the state exists (one that was copied in with
 an older timestamp) is copied to the clipboard as well and then removed from
 the folder — you get the content and the folder stays clean. This does not
@@ -272,6 +299,15 @@ Add `--verbose` for a line per cycle (handy while developing with
   embedded data as well, but only up to 64 MB; above that, pasting after the
   file was reaped may fail, because the file-object reference needs the
   source to still exist.
+- A PDF also offers a reference to the file itself. That reference needs the
+  file to still exist: once the reaper has moved it to the Trash, an app
+  that takes the file rather than the embedded PDF data will not find it.
+  The embedded PDF data is unaffected.
+- macOS rasterises a PDF to its **first page** when the target only accepts
+  images. Pseudocopy keeps the whole document, offers the file itself and
+  logs a warning for a multi-page PDF; paste into a PDF-aware app or as a
+  file to get every page. A multi-page TIFF has the same limitation: the
+  image target sees the first frame.
 - Text files are only pasted as text up to 16 MB — bigger ones are offered
   as a file reference instead, because the bytes would cost about three
   times their size in memory. Images and PDFs are not materialised above
@@ -306,15 +342,39 @@ Scripts/release.sh          # universal binary + GitHub release (maintainers)
 folder and checks clipping, reaping, the exclusion rules (partial downloads,
 dotfiles, directories, symlinks), the process lock, and the safety paths
 (unreadable files, a damaged state file, missing external-volume paths and
-the watch-directory guards). It uses a private state store via
-`PSEUDOCOPY_STATE_ROOT`, writes to the system pasteboard and restores the
-previous (text) clipboard content when it finishes. It is part of CI.
+the watch-directory guards). It compiles
+[`Scripts/pasteboard_inspector.swift`](Scripts/pasteboard_inspector.swift) to
+assert the exact pasteboard representation of every file type, and it
+snapshots and restores the *whole* clipboard (not only its text). It uses a
+private state store via `PSEUDOCOPY_STATE_ROOT`. It is part of CI.
 
 Packaging — the Homebrew tap, the release tarball and why there is no DMG —
 is described in [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md).
 
-The implementation follows `PLAN.md`; the phase-by-phase build log is in the
-git history.
+### Deviations from PLAN.md
+
+`PLAN.md` is normative. Four clipboard rules were extended after real-world
+testing; everything else follows the plan, and the phase-by-phase build log
+is in the git history.
+
+1. **Classification is content-first.** §2.2 decides the type by extension;
+   pseudocopy checks the PDF header (CoreGraphics) and lets ImageIO identify
+   images before falling back to the extension lists. Both are system
+   frameworks that AppKit already links — there is still no third-party
+   dependency. This is what makes a mislabelled image, WebP/BMP and
+   extensionless text work.
+2. **Text is written under two UTIs.** §2.2 names only
+   `public.utf8-plain-text`; `public.plain-text` is written alongside it so
+   apps using the modern identifier get the text.
+3. **A PDF also carries a file reference.** §2.2 gives a PDF only the
+   `com.adobe.pdf` data. Without the file URL, an app that cannot take PDF
+   data lets macOS rasterise page 1, and the other pages are lost.
+4. **Extensionless UTF-8 files are text.** §2.2's text set is a fixed
+   extension list; a file whose extension is unknown (or absent) is treated
+   as text when its bytes are valid UTF-8 without NUL bytes.
+
+The smoke test asserts each of these, so the behaviour cannot regress
+silently.
 
 ### Internals
 
