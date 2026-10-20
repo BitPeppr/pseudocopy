@@ -15,9 +15,9 @@ struct Configuration {
 
     static var `default`: Configuration {
         Configuration(
-            watchDir: URL(fileURLWithPath: (NSHomeDirectory() as NSString).appendingPathComponent("Temp"))
-                .standardizedFileURL
-                .resolvingSymlinksInPath(),
+            watchDir: URL(fileURLWithPath: canonicalPath(
+                URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Temp")
+            )),
             ttl: Constants.defaultTTL,
             embedLimitBytes: Constants.embedLimitBytes,
             verbose: false,
@@ -35,9 +35,52 @@ struct Configuration {
         guard !expanded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw CLIError.usage("--dir must not be empty")
         }
-        return URL(fileURLWithPath: expanded)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
+        let url = URL(fileURLWithPath: canonicalPath(URL(fileURLWithPath: expanded)))
+        try validateWatchDir(url)
+        return url
+    }
+
+    /// Refuses folders where the reaper would do more harm than good.
+    ///
+    /// The tool is built around a *dedicated* folder. Watching the home
+    /// directory (or a system/shared root) would move unrelated files to the
+    /// Trash one TTL after they were last touched, which is exactly the
+    /// accident this guard exists to prevent. Personal folders such as
+    /// `~/Downloads` remain allowed — they are the documented use case — but
+    /// `install` warns when the target already contains files.
+    static func validateWatchDir(_ url: URL) throws {
+        let path = url.standardizedFileURL.path
+        let home = URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path
+        let refused: Set<String> = [
+            "/", "/Users", "/Users/Shared",
+            "/System", "/Library", "/Applications", "/Volumes",
+            "/tmp", "/private/tmp", "/var", "/private/var",
+            "/var/tmp", "/private/var/tmp",
+            "/etc", "/private/etc", "/usr", "/opt",
+            "/bin", "/sbin", "/dev", "/private", "/cores",
+            "/Network", "/home", "/net", "/private/var/root",
+            home + "/Library", home + "/.Trash",
+        ]
+        if refused.contains(path) || path == home {
+            throw CLIError.usage("refusing to watch \(path) — use a dedicated folder such as ~/Temp")
+        }
+        if home.hasPrefix(path + "/") {
+            throw CLIError.usage("refusing to watch \(path) — it contains your home folder")
+        }
+        if path.hasPrefix("/Users/") && !path.hasPrefix(home + "/") {
+            throw CLIError.usage("refusing to watch \(path) — it is another user's home folder")
+        }
+        if path.hasPrefix("/Volumes/"),
+           URL(fileURLWithPath: path).deletingLastPathComponent().standardizedFileURL.path == "/Volumes" {
+            throw CLIError.usage("refusing to watch the root of an external volume — use a folder inside it")
+        }
+
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        let stateRoot = canonicalPath(appSupport.appendingPathComponent(Constants.appSupportFolder))
+        if path == stateRoot {
+            throw CLIError.usage("refusing to watch \(path) — the state store lives there")
+        }
     }
 
     /// Parses the global flags (`--dir`, `--ttl`, `--verbose`, `--no-trash`).

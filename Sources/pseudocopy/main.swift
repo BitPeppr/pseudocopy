@@ -84,6 +84,13 @@ enum CLI {
         while index < args.count {
             let arg = args[index]
 
+            // Everything after `--` is a positional argument, so a file called
+            // `-notes.txt` can still be clipped.
+            if arg == "--" {
+                positional.append(contentsOf: args[(index + 1)...])
+                break
+            }
+
             func value(for flag: String) throws -> String {
                 index += 1
                 guard index < args.count else {
@@ -184,7 +191,7 @@ enum CLI {
         USAGE:
           pseudocopy run                 # one watch+reap cycle (what launchd calls)
           pseudocopy loop [--interval N] # resident loop, for foreground development only
-          pseudocopy clean [--no-trash]  # force-reap right now (files older than TTL)
+          pseudocopy clean [--no-trash]  # force-reap now; bypasses the settle rule
           pseudocopy clip <path...>      # clip a file manually, bypassing settle logic
           pseudocopy gen-tests <dir>     # write sample files for testing
           pseudocopy install             # write LaunchAgent plist + launchctl bootstrap
@@ -195,11 +202,19 @@ enum CLI {
           pseudocopy help                # usage
 
         GLOBAL FLAGS:
-          --dir <path>      watch dir (default ~/Temp); created on install if missing
+          --dir <path>      watch dir (default ~/Temp); refuses /, your home
+                            folder, /Volumes and shared temp roots
           --ttl <seconds>   reaper time-to-live (default 3600)
           --verbose         log every cycle, not just events
           --no-trash        delete permanently instead of moving to the Trash
+                            (`install` freezes this into the agent)
           --interval <secs> cycle interval for `loop` (default 5)
+
+        NOTES:
+          Files already in the folder when it is first seen (or after the state
+          was lost) are treated as leftovers and are not copied.
+          `clean` is an explicit override: do not run it while a download is
+          in progress. `clip` does not update the agent's state.
 
         EXIT CODES:
           0  success

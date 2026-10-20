@@ -4,7 +4,7 @@ import Foundation
 enum Constants {
     /// The released version. `Scripts/release.sh` reads this value and
     /// refuses to publish a tag that does not match it.
-    static let version = "1.0.1"
+    static let version = "1.0.2"
 
     /// Seconds between cycles when running in resident `loop` mode.
     /// The LaunchAgent uses the same value as its `StartInterval`.
@@ -12,6 +12,11 @@ enum Constants {
 
     /// Default reaper time-to-live: one hour.
     static let defaultTTL: TimeInterval = 3600
+
+    /// How often the `seen` timestamp of a watch folder is refreshed. It only
+    /// drives the 24-hour namespace grace, so a coarse value keeps the state
+    /// file from being rewritten on every idle cycle.
+    static let seenRefreshInterval: TimeInterval = 3600
 
     /// Maximum size of a file whose raw bytes get embedded in the pasteboard.
     static let embedLimitBytes: Int = 64 << 20

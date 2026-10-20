@@ -27,11 +27,13 @@ brew services start pseudocopy
 ```
 
 The formula installs the universal binary and a LaunchAgent that runs
-`pseudocopy run` every five seconds. It watches `~/Temp`; use the source
-install below if you want another folder or a different TTL. Do **not** run
-`pseudocopy install` as well — it refuses while the Homebrew service is
-loaded. `pseudocopy status` and `pseudocopy kick` work with the Homebrew
-service; use `brew services` to start, stop, or restart it.
+`pseudocopy run` every five seconds. It watches `~/Temp`. To watch another
+folder or use a different TTL, stop the service and run the built-in
+installer (`brew services stop pseudocopy; pseudocopy install --dir <path>`),
+or use the source install below. Do **not** run `pseudocopy install` while
+the Homebrew service is loaded — it refuses. `pseudocopy status` and
+`pseudocopy kick` work with the Homebrew service; use `brew services` to
+start, stop, or restart it.
 
 ### From source
 
@@ -60,9 +62,10 @@ mkdir -p ~/bin && cp .build/release/pseudocopy ~/bin/
 ~/bin/pseudocopy install --dir ~/Temp
 ```
 
-The TTL is written into the agent's plist when it is installed, so changing
-it later means re-running `pseudocopy install`. The same is true for the
-watch folder — the agent always watches the directory it was installed with.
+The TTL, the watch folder and the deletion mode are written into the agent's
+plist when it is installed, so changing any of them later means re-running
+`pseudocopy install`. The agent always watches the directory it was installed
+with.
 
 ## Uninstall
 
@@ -71,8 +74,8 @@ pseudocopy uninstall          # or: ~/bin/pseudocopy uninstall
 ```
 
 This removes the LaunchAgent and its plist. The watch folder and the state
-store (`~/Library/Application Support/pseudocopy/`) are kept; stale records
-are pruned on the next run.
+store (`~/Library/Application Support/pseudocopy/`) are kept, so reinstalling
+with the same folder preserves the history.
 
 ## Use
 
@@ -85,20 +88,27 @@ The same works for anything else that writes into the folder — screenshots,
 `curl -O`, a drag-and-drop from the Finder.
 
 Text, images and PDFs are embedded in the pasteboard, so they survive the
-file being deleted an hour later. Anything else is pasted as a file
-reference (so Finder creates a copy) plus, for files up to 64 MB, the raw
-bytes.
+file being deleted an hour later. A single text/image/PDF clip carries only
+its native representation. Anything else is pasted as a file reference (so
+Finder creates a copy) plus, for files up to 64 MB, the raw bytes. A
+multi-file batch adds file references for every file so the Finder can copy
+them all.
 
 > **Use a dedicated folder.** Everything in the *top level* of the watch
 > folder is subject to the one hour reaper — do not point `pseudocopy` at a
-> shared directory such as `/tmp`.
+> shared directory such as `/tmp`. `install` and `run` refuse `/`, your home
+> folder, another user's home, `/Users`, `/System`, `/Library`, `/var`,
+> `/Volumes`, the root of an external volume, the shared temp roots and the
+> state store itself. Personal folders such as `~/Downloads` are allowed, but
+> everything there is subject to the reaper; `install` warns if the target
+> already contains files.
 
 ### Commands
 
 ```
 pseudocopy run                 # one watch+reap cycle (what launchd calls)
 pseudocopy loop [--interval N] # resident loop, for foreground development only
-pseudocopy clean [--no-trash]  # force-reap right now (files older than the TTL)
+pseudocopy clean [--no-trash]  # force-reap now; bypasses the settle rule
 pseudocopy clip <path...>      # clip a file manually, bypassing the settle logic
 pseudocopy gen-tests <dir>     # write sample files for testing
 pseudocopy install             # write the LaunchAgent plist + launchctl bootstrap
@@ -111,11 +121,18 @@ pseudocopy help                # usage
 
 Global flags: `--dir <path>` (watch folder, default `~/Temp`), `--ttl <seconds>`
 (default `3600`), `--verbose` (log every cycle), `--no-trash` (delete
-permanently instead of using the Trash).
+permanently instead of using the Trash; `install` freezes this into the
+agent).
 
 `pseudocopy clip a.txt b.txt` puts several files on the pasteboard at once:
 a paste into the Finder copies all of them, a paste into a text field
-inserts the first one — a pasteboard holds a single value per type.
+inserts the first one — a pasteboard holds a single value per type. `clip`
+does not update the agent's state, so the agent may copy a file again when
+it settles.
+
+`clean` is an explicit override: it reaps every file older than the TTL
+right now, including files the agent has never seen. Do not run it while a
+download is in progress.
 
 Exit codes: `0` on success, `1` on a runtime error (the reason is written to
 stderr). Without a subcommand nothing happens — `pseudocopy` prints the usage
@@ -133,9 +150,11 @@ Because of that second observation, a file appears on the clipboard roughly
 5–10 seconds after it was written: the agent checks every 5 seconds and
 needs two identical readings.
 
-An old file (one that was copied in with an older timestamp) is copied to the
-clipboard as well and then removed from the folder — you get the content and
-the folder stays clean.
+An old file that arrives after the state exists (one that was copied in with
+an older timestamp) is copied to the clipboard as well and then removed from
+the folder — you get the content and the folder stays clean. This does not
+apply to files that were already there when the folder was first seen; see
+"The first minute".
 
 Ignored entirely: directories, symlinks, dotfiles and partial downloads
 (`.crdownload`, `.part`, `.download`, `.tmp`, `.partial`). A partial download
@@ -143,18 +162,38 @@ is never copied and never reaped; remove it by hand when it is stale.
 
 ### The first minute
 
-When pseudocopy starts for the first time it cannot know which files are
-new. Files that are already in the folder and older than the TTL are
-therefore left alone — they are leftovers, not downloads — while a file that
-appears afterwards is copied as usual. If the state file is ever damaged the
-same rule applies: the folder is not emptied onto the clipboard all at once,
-and the damaged file is kept next to the state store as `state.json.corrupt`
-for diagnosis.
+When pseudocopy sees a folder for the first time (right after install, or
+after the state file was lost or damaged), it cannot know which files are
+new. Every existing file is recorded as a leftover: it is not copied, so the
+folder is not emptied onto the clipboard all at once. Files that are already
+older than the TTL are still moved to the Trash on that first cycle; the rest
+are reaped normally when they expire. Files that arrive afterwards are copied
+as usual. `install` warns when the target folder already contains files.
+
+If the state file is damaged it is kept next to the state store as
+`state.json.corrupt` for diagnosis, and the state is rebuilt with the same
+leftover rule.
+
+### Safety
+
+- A file whose clip failed is **not** reaped. It stays in the folder and the
+  clip is retried; this is what keeps an unreadable or busy file from being
+  deleted before you ever got its content.
+- If the watch folder is unavailable (an external volume that is not
+  mounted), the cycle is skipped and its state namespace is kept. When the
+  volume returns, the files that were already copied are not copied again.
+- A state file written by a **newer** pseudocopy is never overwritten. The
+  cycle stops and the log says which version wrote it, so a downgrade cannot
+  silently discard the newer history.
+- `install` and `run` refuse the folders listed above, `install` refuses an
+  unmounted `/Volumes/...` path, and `install` warns before arming the agent
+  over existing content.
 
 ## Log
 
-The agent writes to `~/Library/Logs/pseudocopy.log`. Nothing is logged while
-the folder is idle — only events:
+The agent writes to `~/Library/Logs/pseudocopy.log`; the file is kept private
+to the user (mode 0600, including when launchd creates it for a Homebrew
+service). Nothing is logged while the folder is idle — only events:
 
 ```
 2026-10-20 14:03:12 [clip] text  ~/Temp/notes.txt
@@ -186,8 +225,10 @@ Add `--verbose` for a line per cycle (handy while developing with
   hand.
 - The reaper uses the older of the creation and modification date, so a file
   that was moved into the folder keeps its original age and may disappear
-  right away. It is copied to the clipboard first, so you still get its
-  content.
+  right away. It is copied to the clipboard first (unless it was already
+  there when the folder was first seen), so you still get its content.
+- `pseudocopy clean` force-reaps everything older than the TTL immediately,
+  bypassing the settle rule. Do not run it during a download.
 - A download that stalls for a full hour is treated like any other finished
   file: it is copied to the clipboard and then removed. Use a longer `--ttl`
   if you resume large downloads by hand.
@@ -203,9 +244,11 @@ Scripts/release.sh          # universal binary + GitHub release (maintainers)
 
 `Scripts/smoke.sh` builds the tool, runs full cycles in a private sandbox
 folder and checks clipping, reaping, the exclusion rules (partial downloads,
-dotfiles, directories, symlinks) and the process lock. It writes to the
-system pasteboard and restores the previous clipboard content when it
-finishes.
+dotfiles, directories, symlinks), the process lock, and the safety paths
+(unreadable files, a damaged state file, missing external-volume paths and
+the watch-directory guards). It uses a private state store via
+`PSEUDOCOPY_STATE_ROOT`, writes to the system pasteboard and restores the
+previous (text) clipboard content when it finishes. It is part of CI.
 
 Packaging — the Homebrew tap, the release tarball and why there is no DMG —
 is described in [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md).
@@ -217,10 +260,17 @@ git history.
 
 - The state lives in `~/Library/Application Support/pseudocopy/state.json`
   (mode 0600), one namespace per watch folder. It is written atomically and
-  only when something actually changed.
+  only when something actually changed; the per-folder "seen" timestamp is
+  refreshed hourly rather than every cycle, so an idle agent does not rewrite
+  it.
+- `PSEUDOCOPY_STATE_ROOT` points the store at another directory. It exists for
+  the smoke test; normal use does not need it.
 - Cycles are serialised with an `flock` on `…/pseudocopy/lock`. The kernel
   releases it when the process dies, so a lock left behind by a killed cycle
   can never wedge the tool. The file contains the PID for diagnostics.
 - The agent runs with `StartInterval` **and** `ThrottleInterval` of 5
   seconds: without the latter, launchd applies its default 10 second
   throttle and the reaction time doubles.
+- A state namespace whose watch folder is gone is pruned after 24 hours. A
+  folder under `/Volumes` that is not mounted never causes a prune: the
+  cycle is skipped without touching the state.

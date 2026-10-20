@@ -23,6 +23,8 @@ jobs:
         run: swift build
       - name: Build (release)
         run: swift build -c release
+      - name: Check the native architecture
+        run: test "$(lipo -archs .build/release/pseudocopy)" = "$(uname -m)"
       - name: Version and usage
         run: |
           .build/release/pseudocopy version
@@ -33,10 +35,20 @@ jobs:
           .build/release/pseudocopy gen-tests "$DIR" > /dev/null
           test "$(find "$DIR" -type f | wc -l | tr -d ' ')" = "8"
 
+  smoke:
+    name: Smoke test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the headless acceptance test
+        run: Scripts/smoke.sh
+
   cross-compile:
     name: Cross-compile (x86_64)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - run: swift build -c release --arch x86_64
-      - run: lipo -info .build/x86_64-apple-macosx/release/pseudocopy
+      - name: Check the cross-compiled architecture
+        run: |
+          lipo -archs .build/x86_64-apple-macosx/release/pseudocopy | tr ' ' '\n' | grep -qx x86_64

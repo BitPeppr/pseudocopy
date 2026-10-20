@@ -5,8 +5,9 @@
 #   Scripts/release.sh
 #
 # The version comes from `Constants.version`; bump it (and CHANGELOG.md)
-# before running this. The script refuses to work on a dirty tree and on an
-# existing tag, so a failed run can be repeated after the problem is fixed.
+# before running this. The script refuses to work on a dirty tree; if the
+# build or upload fails after the tag was pushed, fix the problem and run it
+# again — it resumes from the existing tag instead of refusing.
 #
 set -euo pipefail
 
@@ -19,10 +20,20 @@ VERSION="$(sed -n 's/^    static let version = "\([^"]*\)"$/\1/p' Sources/pseudo
 TAG="v${VERSION}"
 
 [[ -z "$(git status --porcelain)" ]] || fail "the working tree is dirty — commit or stash first"
-git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null && fail "tag ${TAG} already exists"
+[[ "$(git rev-parse --abbrev-ref HEAD)" == "main" ]] || fail "releases are cut from the main branch"
 git remote get-url origin >/dev/null 2>&1 || fail "no 'origin' remote"
 command -v gh >/dev/null || fail "gh is not installed"
 gh auth status >/dev/null 2>&1 || fail "gh is not authenticated"
+
+gh release view "${TAG}" >/dev/null 2>&1 && fail "release ${TAG} already exists"
+
+TAG_EXISTS=0
+if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+    [[ "$(git rev-list -n1 "${TAG}")" == "$(git rev-parse HEAD)" ]] \
+        || fail "tag ${TAG} exists but does not point at HEAD"
+    TAG_EXISTS=1
+    echo "==> resuming with existing tag ${TAG}"
+fi
 
 echo "==> pseudocopy ${VERSION}"
 
@@ -39,7 +50,8 @@ X86_BINARY=".build/x86_64-apple-macosx/release/pseudocopy"
 
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/pseudocopy-release.XXXXXX")"
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/pseudocopy-release-tests.XXXXXX")"
-trap 'rm -rf "${STAGE}" "${SANDBOX}"' EXIT
+NOTES=""
+trap 'rm -rf "${STAGE}" "${SANDBOX}" "${NOTES:-}"' EXIT
 
 cp README.md LICENSE "${STAGE}/"
 lipo -create \
@@ -49,7 +61,11 @@ lipo -create \
 
 # lipo invalidates the linker's ad-hoc signature; sign the fat binary again.
 codesign --force --sign - "${STAGE}/pseudocopy"
+codesign --verify --strict "${STAGE}/pseudocopy"
 lipo -info "${STAGE}/pseudocopy"
+ARCHS="$(lipo -archs "${STAGE}/pseudocopy")"
+[[ "${ARCHS}" == *arm64* && "${ARCHS}" == *x86_64* ]] \
+    || fail "not a universal binary: ${ARCHS}"
 
 echo "==> checking the binary"
 [[ "$("${STAGE}/pseudocopy" version)" == "pseudocopy ${VERSION}" ]] \
@@ -68,9 +84,13 @@ SHA="$(cut -d' ' -f1 "dist/${TARBALL}.sha256")"
 sed -e "s/__VERSION__/${VERSION}/g" -e "s/__SHA256__/${SHA}/g" \
     Distribution/homebrew/pseudocopy.rb.template > "dist/pseudocopy.rb"
 
-echo "==> tagging ${TAG}"
-git tag -a "${TAG}" -m "pseudocopy ${VERSION}"
+echo "==> pushing main"
 git push origin HEAD
+
+if [[ "${TAG_EXISTS}" == 0 ]]; then
+    echo "==> tagging ${TAG}"
+    git tag -a "${TAG}" -m "pseudocopy ${VERSION}"
+fi
 git push origin "${TAG}"
 
 echo "==> publishing the release"
@@ -96,14 +116,21 @@ The tarball is a universal binary (arm64 + x86_64) for macOS 13 or newer.
 It is ad-hoc signed, not notarised: download it with \`curl\`, not with a
 browser, or Gatekeeper will quarantine it.
 
-See the README for the full manual, the caveats and the log format.
+Full changelog:
+https://github.com/BitPeppr/pseudocopy/blob/${TAG}/CHANGELOG.md
 EOF
 gh release create "${TAG}" \
     "dist/${TARBALL}" \
     "dist/${TARBALL}.sha256" \
     --title "pseudocopy ${VERSION}" \
-    --notes-file "${NOTES}"
+    --notes-file "${NOTES}" \
+    --verify-tag
 rm -f "${NOTES}"
+NOTES=""
+
+gh release view "${TAG}" --json assets --jq '.assets[].name' > "${STAGE}/assets.txt"
+grep -qx "${TARBALL}" "${STAGE}/assets.txt" || fail "the release is missing ${TARBALL}"
+grep -qx "${TARBALL}.sha256" "${STAGE}/assets.txt" || fail "the release is missing ${TARBALL}.sha256"
 
 cat <<EOF
 

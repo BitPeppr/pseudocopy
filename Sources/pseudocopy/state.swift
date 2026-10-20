@@ -39,15 +39,30 @@ struct StateStore {
     /// True when the store had to be built from scratch because the file was
     /// missing or damaged — every file then looks brand new.
     private(set) var wasReset = false
+    /// True when the state file was written by a newer pseudocopy. The cycle
+    /// must not touch it: overwriting it would discard a newer version's
+    /// history (and could re-clip or reap files after a downgrade).
+    private(set) var isBlockedByNewerVersion = false
     /// How long a watch folder may be gone before its history is dropped.
     private static let namespaceGrace: TimeInterval = 24 * 3600
 
     init(watchDir: URL) {
         self.watchDir = watchDir
-        self.namespaceKey = watchDir.standardizedFileURL.resolvingSymlinksInPath().path
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-        self.root = appSupport.appendingPathComponent(Constants.appSupportFolder, isDirectory: true)
+        self.namespaceKey = canonicalPath(watchDir)
+
+        // The smoke test points the store at a private directory so it cannot
+        // touch the live state. Foundation ignores a redirected $HOME for the
+        // application-support lookup, so this small override is the only way
+        // to make the tests hermetic.
+        if let override = ProcessInfo.processInfo.environment["PSEUDOCOPY_STATE_ROOT"],
+           !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let expanded = (override as NSString).expandingTildeInPath
+            self.root = URL(fileURLWithPath: expanded).standardizedFileURL
+        } else {
+            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+            self.root = appSupport.appendingPathComponent(Constants.appSupportFolder, isDirectory: true)
+        }
         self.file = StateFile()
     }
 
@@ -71,6 +86,7 @@ struct StateStore {
     /// down with it: every namespace is decoded on its own, and a file that
     /// cannot be parsed at all is kept as `.corrupt` for diagnosis.
     mutating func load() {
+        isBlockedByNewerVersion = false
         guard let data = try? Data(contentsOf: stateFileURL) else {
             file = StateFile()
             lastWritten = nil
@@ -81,10 +97,14 @@ struct StateStore {
         let decoder = JSONDecoder()
         if let decoded = try? decoder.decode(StateFile.self, from: data) {
             if decoded.version > Constants.stateVersion {
-                // A file from a newer version: do not try to interpret it.
-                Logger.log(.error, "state", "state file version \(decoded.version) is newer than the supported \(Constants.stateVersion)")
+                // A file from a newer version: do not interpret it, and above
+                // all do not overwrite it. The cycle stops instead.
+                Logger.log(.error, "state", "state file version \(decoded.version) is newer than the supported \(Constants.stateVersion) — skipping this cycle")
                 file = StateFile()
-                wasReset = true
+                lastWritten = nil
+                wasReset = false
+                isBlockedByNewerVersion = true
+                return
             } else {
                 file = decoded
                 // A watch folder that the store has never seen is unknown, not
@@ -110,6 +130,15 @@ struct StateStore {
                 wasReset = false
             }
         }
+
+        // A state file from an older version (or one recovered leniently)
+        // may have no `seen` entry. Give those namespaces the full grace
+        // period instead of treating them as ancient and pruning immediately.
+        let now = Date()
+        for key in file.dirs.keys where file.seen[key] == nil {
+            file.seen[key] = now
+        }
+
         lastWritten = try? encoder.encode(file)
     }
 
@@ -139,11 +168,22 @@ struct StateStore {
                 file.lastScan[name] = scan
             }
         }
-        if let seen = json["seen"] as? [String: Date] {
-            file.seen = seen
+        // `JSONSerialization` turns the encoded dates into `NSNumber`, not
+        // `Date`; casting straight to `[String: Date]` always fails and would
+        // silently drop the namespace grace information. `JSONEncoder`'s
+        // default strategy stores seconds since 2001-01-01 (the reference
+        // date), not since 1970.
+        if let seen = json["seen"] as? [String: Any] {
+            for (key, value) in seen {
+                guard let number = value as? NSNumber else { continue }
+                file.seen[key] = Date(timeIntervalSinceReferenceDate: number.doubleValue)
+            }
         }
-        if let errors = json["clipErrors"] as? [String: Date] {
-            file.clipErrors = errors
+        if let errors = json["clipErrors"] as? [String: Any] {
+            for (key, value) in errors {
+                guard let number = value as? NSNumber else { continue }
+                file.clipErrors[key] = Date(timeIntervalSinceReferenceDate: number.doubleValue)
+            }
         }
         return recovered
     }
@@ -172,14 +212,17 @@ struct StateStore {
     /// the cycle runs every five seconds, forever.
     mutating func save() throws {
         let data = try encoder.encode(file)
+        // Nothing to write when the content did not change — the cycle runs
+        // every five seconds, forever. The file-exists check covers a state
+        // file that was removed behind our back.
+        if let last = lastWritten, last == data,
+           FileManager.default.fileExists(atPath: stateFileURL.path) {
+            return
+        }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         // The folder may have been created with looser permissions before.
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateFileURL.path)
-        if let last = lastWritten, last == data {
-            return
-        }
         try data.write(to: stateFileURL, options: [.atomic])
         // The state file lists every file that was ever clipped — keep it
         // private to the user.
@@ -208,7 +251,15 @@ struct StateStore {
     }
 
     /// Records that this watch folder was seen in this cycle.
+    ///
+    /// The timestamp is only used for the 24-hour namespace grace period, so
+    /// updating it every five seconds would rewrite the state file forever
+    /// without changing the outcome. One-hour granularity is plenty.
     mutating func markSeen(at date: Date = Date()) {
+        if let last = file.seen[namespaceKey],
+           date.timeIntervalSince(last) < Constants.seenRefreshInterval {
+            return
+        }
         file.seen[namespaceKey] = date
     }
 
@@ -222,6 +273,11 @@ struct StateStore {
     /// Remembers that a clip error was reported.
     mutating func noteError(path: String, at date: Date = Date()) {
         file.clipErrors[path] = date
+    }
+
+    /// Forgets a previous clip error after the file was delivered.
+    mutating func clearError(path: String) {
+        file.clipErrors.removeValue(forKey: path)
     }
 
     /// Removes records whose files no longer exist (§2.3) and watch folders
@@ -244,12 +300,17 @@ struct StateStore {
         // after they have been gone for a while, so that an unmounted volume
         // does not lose its history.
         let now = Date()
-        for key in file.dirs.keys where !FileManager.default.fileExists(atPath: key) {
-            let lastSeen = file.seen[key] ?? .distantPast
+        for key in Array(file.dirs.keys) where !FileManager.default.fileExists(atPath: key) {
+            let lastSeen = file.seen[key] ?? now
             guard now.timeIntervalSince(lastSeen) >= StateStore.namespaceGrace else { continue }
             file.dirs.removeValue(forKey: key)
             file.lastScan.removeValue(forKey: key)
             file.seen.removeValue(forKey: key)
         }
+
+        // Clip errors are only needed for log throttling; do not keep them
+        // for paths that have been gone for more than a day.
+        let cutoff = now.addingTimeInterval(-24 * 3600)
+        file.clipErrors = file.clipErrors.filter { $0.value >= cutoff }
     }
 }

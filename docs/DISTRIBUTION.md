@@ -22,9 +22,10 @@ should be shipped.
   never gets the quarantine attribute. The binary is ad-hoc signed, and
   macOS runs it normally when it was not downloaded by a browser.
 - **The service fits the design.** The formula's `service` block emits
-  `StartInterval 5` plus `ThrottleInterval 5`, which is exactly what the
-  built-in `pseudocopy install` writes: one short-lived cycle every five
-  seconds, no resident daemon.
+  `StartInterval 5` plus `ThrottleInterval 5` and `ProcessType Interactive`,
+  matching the plist written by the built-in `pseudocopy install` (only the
+  launchd label differs, because Homebrew owns it): one short-lived cycle
+  every five seconds, no resident daemon.
 
 ## Why not a DMG
 
@@ -80,14 +81,19 @@ with the version and the SHA-256 of the published tarball already filled in.
 
 1. Bump `Constants.version` in `Sources/pseudocopy/constants.swift` and add a
    `CHANGELOG.md` entry.
-2. Commit everything (`Scripts/release.sh` refuses a dirty tree).
-3. Run `Scripts/release.sh`. It builds arm64 and x86_64, `lipo`s them into a
-   universal binary, verifies it, writes
+2. Run `Scripts/smoke.sh`; CI runs it as well.
+3. Commit everything (`Scripts/release.sh` refuses a dirty tree) and push
+   `main`.
+4. Run `Scripts/release.sh`. It builds arm64 and x86_64, `lipo`s them into a
+   universal binary, verifies both slices and the ad-hoc signature, writes
    `dist/pseudocopy-<version>-macos-universal.tar.gz` plus its `.sha256`,
-   tags `v<version>`, pushes, and creates the GitHub release.
-4. Copy `dist/pseudocopy.rb` to `Formula/pseudocopy.rb` in
+   tags `v<version>`, pushes, and creates the GitHub release. If the build or
+   upload fails after the tag was pushed, fix the problem and run it again:
+   a tag that still points at `HEAD` is resumed, an existing release is not
+   overwritten.
+5. Copy `dist/pseudocopy.rb` to `Formula/pseudocopy.rb` in
    `BitPeppr/homebrew-tap`, commit and push.
-5. `brew update && brew upgrade pseudocopy` to verify the tap.
+6. `brew update && brew upgrade pseudocopy` to verify the tap.
 
 The script needs a full Xcode installation (the x86_64 SDK) and an
 authenticated `gh` CLI.

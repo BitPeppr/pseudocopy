@@ -107,13 +107,33 @@ func isExpired(created: Date?, modified: Date?, now: Date, ttl: TimeInterval) ->
 
 // MARK: - Paths
 
-/// Normalized state key for a file: absolute, standardized, no trailing slash.
+/// Canonical absolute path for a file or directory.
 ///
-/// The watch folder is already resolved when the configuration is built, so
-/// the paths below it do not need to be resolved again — that would cost one
-/// `lstat` per path component for every file, every cycle.
-func normalizedPath(_ url: URL) -> String {
-    url.standardizedFileURL.path
+/// `URL.resolvingSymlinksInPath()` deliberately leaves `/var` alone, while
+/// the kernel and `pwd -P` report `/private/var` — the same folder under two
+/// spellings. `realpath(3)` gives one spelling for both the watch folder and
+/// its files, which matters because these paths are state-store keys.
+func canonicalPath(_ url: URL) -> String {
+    let standardized = url.standardizedFileURL
+    let fileManager = FileManager.default
+
+    if fileManager.fileExists(atPath: standardized.path) {
+        if let resolved = realpath(standardized.path, nil) {
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+    } else {
+        // A missing leaf (the watch folder before `install` creates it) still
+        // needs the canonical prefix of its parent.
+        let parent = standardized.deletingLastPathComponent()
+        if fileManager.fileExists(atPath: parent.path),
+           let resolvedParent = realpath(parent.path, nil) {
+            defer { free(resolvedParent) }
+            return URL(fileURLWithPath: String(cString: resolvedParent))
+                .appendingPathComponent(standardized.lastPathComponent).path
+        }
+    }
+    return standardized.path
 }
 
 /// Human readable path, with the home directory abbreviated to `~`.
@@ -210,13 +230,26 @@ final class ProcessLock {
 
 // MARK: - Cycle
 
+/// What the scan found.
+private enum ScanOutcome {
+    /// The folder was read; these are its top-level entries.
+    case entries([ScanEntry])
+    /// The folder was missing and has just been recreated. The cycle is
+    /// skipped so that the empty folder does not immediately prune the
+    /// history of a folder that was renamed or unmounted for a moment.
+    case recreated(URL)
+    /// The folder cannot be observed (unmounted volume, unreadable parent).
+    /// The state must not be touched: an empty listing is not an empty folder.
+    case unavailable(URL)
+}
+
 /// Scans the watch directory and classifies every top level entry.
 ///
 /// A missing watch directory is recreated when its parent still exists (the
 /// user may simply have deleted it); when the parent is gone as well the
 /// volume is probably not mounted, and the agent stays quiet instead of
 /// filling the log every five seconds.
-private func scanEntries(_ dir: URL, previous: [String: Fingerprint]) throws -> [ScanEntry] {
+private func scanEntries(_ dir: URL, previous: [String: Fingerprint]) throws -> ScanOutcome {
     var isDirectory: ObjCBool = false
     let exists = FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDirectory)
 
@@ -228,28 +261,43 @@ private func scanEntries(_ dir: URL, previous: [String: Fingerprint]) throws -> 
         let isVolumePath = parent.path == "/Volumes" || parent.path.hasPrefix("/Volumes/")
         if !isVolumePath,
            FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDirectory), isDirectory.boolValue {
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
-                                                     attributes: [.posixPermissions: 0o700])
-            Logger.verboseLog(.error, "dir", "recreated the watch directory \(dir.path)")
-        }
-        // The folder may still be missing — for instance when it points into
-        // a volume that is not mounted.
-        guard FileManager.default.fileExists(atPath: dir.path) else {
-            if isRunningAsAgent() {
-                // The volume is not mounted — there is nothing to do and nobody
-                // to tell: the agent would otherwise log this every five seconds.
-                Logger.verboseLog(.error, "dir", "watch directory \(dir.path) is unavailable")
-                return []
+            do {
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                                         attributes: [.posixPermissions: 0o700])
+                Logger.verboseLog(.error, "dir", "recreated the watch directory \(dir.path)")
+                return .recreated(dir)
+            } catch {
+                Logger.verboseLog(.error, "dir", "could not recreate \(dir.path): \(error.localizedDescription)")
             }
-            throw CLIError.usage("watch directory does not exist: \(dir.path)")
         }
+        if isRunningAsAgent() {
+            // The volume is not mounted — there is nothing to do and nobody
+            // to tell: the agent would otherwise log this every five seconds.
+            Logger.verboseLog(.error, "dir", "watch directory \(dir.path) is unavailable — skipping this cycle")
+            return .unavailable(dir)
+        }
+        throw CLIError.usage("watch directory does not exist: \(dir.path)")
     } else if !isDirectory.boolValue {
         throw CLIError.usage("watch directory is not a directory: \(dir.path)")
     }
 
+    let urls: [URL]
+    do {
+        urls = try topLevelEntries(dir)
+    } catch {
+        if isRunningAsAgent() {
+            Logger.verboseLog(.error, "dir", "cannot read \(dir.path): \(error.localizedDescription)")
+            return .unavailable(dir)
+        }
+        throw error
+    }
+
+    // One canonical prefix for every key: the namespace and the file keys
+    // must use the same `/private/var` spelling.
+    let namespace = canonicalPath(dir)
     var entries: [ScanEntry] = []
-    for url in try topLevelEntries(dir) {
-        let path = normalizedPath(url)
+    for url in urls {
+        let path = namespace + "/" + url.lastPathComponent
         if partialFileExtension(url.lastPathComponent) {
             entries.append(ScanEntry(url: url, path: path, fingerprint: nil, created: nil, modified: nil, verification: .partial))
             continue
@@ -274,13 +322,29 @@ private func scanEntries(_ dir: URL, previous: [String: Fingerprint]) throws -> 
             verification: verification
         ))
     }
-    return entries
+    return .entries(entries)
 }
 
-/// True when this process was started by the LaunchAgent.
+/// True when this process was started by a LaunchAgent.
+///
+/// Homebrew 5 names its service `sh.brew.<formula>` and older versions used
+/// `homebrew.mxcl.<formula>`; both must be recognised, otherwise the quiet
+/// "volume is not mounted" path is dead code on the recommended install.
 func isRunningAsAgent() -> Bool {
     guard let service = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"] else { return false }
-    return service == Constants.agentLabel || service.hasSuffix("/" + Constants.agentLabel)
+    let labels = [Constants.agentLabel] + Constants.homebrewAgentLabels
+    return labels.contains { service == $0 || service.hasSuffix("/" + $0) }
+}
+
+/// Keeps the agent log private. Launchd creates the file with the default
+/// umask (0644); the built-in installer chmods it, but `brew services` never
+/// runs that code. The log lists the names of the files that were copied.
+private func ensureLogIsPrivate() {
+    let path = AgentPaths.logURL.path
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+          let permissions = attributes[.posixPermissions] as? NSNumber,
+          permissions.intValue & 0o777 != 0o600 else { return }
+    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
 }
 
 /// True when the reaper may act on a file (§2.3).
@@ -290,15 +354,16 @@ func isRunningAsAgent() -> Bool {
 /// written changes its size or its modification time. A file that was already
 /// copied to the pasteboard is known to be complete.
 ///
-/// `force` is used by the explicit `clean` command: there the user asked for
-/// the old files to go, so files that were never seen before are reaped too
-/// (the file is re-read right before it is moved, so a file that is being
-/// written right now is still spared).
+/// `force` is used by the explicit `clean` command: the user asked for the
+/// old files to go now, so files that were never seen before are reaped too.
+/// The reaper re-stats the file immediately before moving it, which catches
+/// changes during the scan, but `clean` does not promise to spare a file that
+/// is being written at that exact moment.
 private func isSettledForReaping(record: StateRecord?, observed: Fingerprint, force: Bool) -> Bool {
     if force {
-        // The user asked for it explicitly. The file is read again right
-        // before it is moved, so a file that is being written right now is
-        // still spared.
+        // The user asked for it explicitly; the fresh stat before the move
+        // still catches files that changed during the scan. It is not a
+        // guarantee against a file that is being written at this instant.
         return true
     }
     guard let record = record else {
@@ -319,6 +384,9 @@ func runCycle(config: Configuration) throws {
 /// The shared cycle: scan → clip → reap → prune → save.
 private func performCycle(config: Configuration, clipping: Bool, force: Bool) throws {
     Logger.verbose = config.verbose
+    if isRunningAsAgent() {
+        ensureLogIsPrivate()
+    }
 
     var store = StateStore(watchDir: config.watchDir)
 
@@ -342,66 +410,116 @@ private func performCycle(config: Configuration, clipping: Bool, force: Bool) th
     defer { lock.release() }
 
     store.load()
+    if store.isBlockedByNewerVersion {
+        // `load` has already explained why. Leave the lock and the file alone.
+        return
+    }
     let previous = store.lastScan
     var records = store.records
 
-    let entries = try scanEntries(config.watchDir, previous: previous)
+    let outcome = try scanEntries(config.watchDir, previous: previous)
+    let entries: [ScanEntry]
+    switch outcome {
+    case .entries(let scanned):
+        entries = scanned
+    case .recreated, .unavailable:
+        // The folder could not be observed (or was just recreated). Do not
+        // prune, mark or save anything: an empty listing is not an empty
+        // folder, and wiping the namespace would re-clip the whole folder
+        // when an external volume is mounted again.
+        return
+    }
     let now = Date()
+
+    // Paths whose clip failed in this cycle. They stay out of the reaper so
+    // that content which never reached the pasteboard is not deleted.
+    var clipFailures = Set<String>()
 
     // --- clip pass -------------------------------------------------------
     if clipping {
         if store.wasReset {
             // The state was lost, so the tool cannot know which of these
-            // files are new. They are treated as already handled, so that the
-            // whole folder is not copied onto the clipboard one file after
-            // the other. A file that is downloaded again has a new fingerprint
-            // and is copied then.
+            // files are new. Treat every existing file as a leftover: the
+            // folder is not emptied onto the clipboard one file after the
+            // other. Files already older than the TTL are still reaped below;
+            // the install warning tells the user about that.
             for entry in entries {
                 guard let current = entry.fingerprint else { continue }
-                // A file that is already older than the TTL is not marked as
-                // handled: it still has to settle and be copied, so that the
-                // user gets its content before it is reaped.
-                guard !isExpired(created: entry.created, modified: entry.modified, now: now, ttl: config.ttl) else {
-                    continue
-                }
                 var record = records[entry.path] ?? StateRecord(lastFingerprint: current, clippedFingerprint: nil)
                 record.lastFingerprint = current
                 record.clippedFingerprint = current
                 records[entry.path] = record
             }
-            Logger.log(.state, "state", "the state was rebuilt — the files that were already there are not copied")
+            let existing = entries.filter { $0.fingerprint != nil }.count
+            let expired = entries.filter {
+                guard $0.fingerprint != nil else { return false }
+                return isExpired(created: $0.created, modified: $0.modified, now: now, ttl: config.ttl)
+            }.count
+            Logger.log(.state, "state", "the state was rebuilt — \(existing) existing file(s) are treated as leftovers and are not copied")
+            if expired > 0 {
+                Logger.log(.state, "state", "\(expired) of them are already older than the TTL and will be reaped")
+            }
         } else {
+            var candidates: [(entry: ScanEntry, fingerprint: Fingerprint)] = []
             for entry in entries {
                 guard case .settled = entry.verification, let current = entry.fingerprint else {
                     continue
                 }
                 if records[entry.path]?.clippedFingerprint == current {
-                    Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) already clipped")
+                    Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) already handled")
                     continue
                 }
+                candidates.append((entry, current))
+            }
 
-                let kind = classifyFile(entry.url)
-                let written: FileKind
+            if !candidates.isEmpty {
                 do {
-                    written = try putOnClipboard(kind: kind, url: entry.url, embedLimit: config.embedLimitBytes)
-                } catch {
-                    // The file stays unclipped and is retried on the next
-                    // cycle. A failure that repeats is only reported once a
-                    // minute, so that a stuck file cannot fill the log.
-                    if store.shouldReportError(path: entry.path) {
-                        Logger.log(.error, "clip", "\(displayPath(entry.url)): \(error.localizedDescription)")
-                    }
-                    store.noteError(path: entry.path)
-                    continue
-                }
-                Logger.log(.clip, written.rawValue, displayPath(entry.url))
+                    let batch = try putFilesOnClipboardBestEffort(
+                        kinds: candidates.map { classifyFile($0.entry.url) },
+                        urls: candidates.map { $0.entry.url },
+                        embedLimit: config.embedLimitBytes
+                    )
+                    for (index, candidate) in candidates.enumerated() {
+                        guard let written = batch.kinds[index] else {
+                            clipFailures.insert(candidate.entry.path)
+                            if store.shouldReportError(path: candidate.entry.path) {
+                                let reason = batch.failures.first(where: { $0.index == index })?.error.localizedDescription
+                                    ?? "could not be read"
+                                Logger.log(.error, "clip", "\(displayPath(candidate.entry.url)): \(reason)")
+                            }
+                            store.noteError(path: candidate.entry.path)
+                            continue
+                        }
+                        Logger.log(.clip, written.rawValue, displayPath(candidate.entry.url))
+                        store.clearError(path: candidate.entry.path)
 
-                var record = records[entry.path] ?? StateRecord(lastFingerprint: current, clippedFingerprint: nil)
-                record.lastFingerprint = current
-                record.clippedFingerprint = current
-                records[entry.path] = record
+                        var record = records[candidate.entry.path]
+                            ?? StateRecord(lastFingerprint: candidate.fingerprint, clippedFingerprint: nil)
+                        record.lastFingerprint = candidate.fingerprint
+                        record.clippedFingerprint = candidate.fingerprint
+                        records[candidate.entry.path] = record
+                    }
+                } catch {
+                    // The pasteboard transaction itself failed: none of the
+                    // batch was delivered, so none may be reaped this cycle.
+                    for candidate in candidates {
+                        clipFailures.insert(candidate.entry.path)
+                        store.noteError(path: candidate.entry.path)
+                    }
+                    Logger.log(.error, "clip", "could not write the pasteboard: \(error.localizedDescription)")
+                }
             }
         }
+    }
+
+    // Persist the clip results before reaping. If the process dies during the
+    // reap pass, the next cycle must not clip the same files again and
+    // overwrite whatever the user copied in the meantime.
+    store.setRecords(records)
+    do {
+        try store.save()
+    } catch {
+        Logger.log(.error, "state", "could not save state: \(error.localizedDescription)")
     }
 
     // --- reap pass -------------------------------------------------------
@@ -410,6 +528,10 @@ private func performCycle(config: Configuration, clipping: Bool, force: Bool) th
     var reaped = Set<String>()
     for entry in entries {
         guard let observed = entry.fingerprint else { continue }
+        guard !clipFailures.contains(entry.path) else {
+            Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) could not be clipped, keeping it")
+            continue
+        }
         guard isExpired(created: entry.created, modified: entry.modified, now: now, ttl: config.ttl) else { continue }
 
         let record = records[entry.path]
@@ -500,7 +622,8 @@ func runLoop(config: Configuration, interval: TimeInterval) throws {
 /// Force-reap everything older than the TTL right now (§2.7).
 func runClean(config: Configuration) throws {
     // `clean` is an explicit request: files that are older than the TTL go
-    // now, even when they were never seen before.
+    // now, even when they were never seen before. It deliberately bypasses
+    // the settle rule — do not run it while a download is in progress.
     try performCycle(config: config, clipping: false, force: true)
 }
 

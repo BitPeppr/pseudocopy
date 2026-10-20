@@ -52,14 +52,21 @@ enum Launchctl {
         "\(domain)/\(name)"
     }
 
-    /// The loaded agent, if any: the one `pseudocopy install` owns first,
-    /// then the ones `brew services` may have created.
-    static func loadedAgent() -> (name: String, output: String)? {
+    /// Every loaded agent label: the one `pseudocopy install` owns and the
+    /// ones `brew services` may have created. Checking only the first match
+    /// would miss a second, conflicting agent.
+    static func loadedAgents() -> [(name: String, output: String)] {
+        var agents: [(name: String, output: String)] = []
         for name in [Constants.agentLabel] + Constants.homebrewAgentLabels {
             let result = run(["print", label(for: name)])
-            if result.status == 0 { return (name, result.output) }
+            if result.status == 0 { agents.append((name, result.output)) }
         }
-        return nil
+        return agents
+    }
+
+    /// The first loaded agent, if any: the built-in one takes precedence.
+    static func loadedAgent() -> (name: String, output: String)? {
+        loadedAgents().first
     }
 
     /// True when this label belongs to a Homebrew-managed service.
@@ -93,11 +100,57 @@ enum Launchctl {
 // MARK: - Plist
 
 /// The absolute path of the running executable.
+///
+/// A Homebrew binary lives in a versioned Cellar directory that `brew upgrade`
+/// deletes. If the program was started through one of Homebrew's stable
+/// symlinks (`bin/pseudocopy`, `opt/pseudocopy/bin/pseudocopy`), that symlink
+/// is the right path to freeze into the LaunchAgent: it keeps pointing at the
+/// current version. The same applies to any other symlink the user invoked.
 func executablePath() -> String {
-    if let path = Bundle.main.executablePath {
-        return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+    let current = URL(fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0])
+        .resolvingSymlinksInPath().path
+
+    if current.contains("/Cellar/") {
+        for candidate in executableCandidates() where
+            URL(fileURLWithPath: candidate).resolvingSymlinksInPath().path == current {
+            return candidate
+        }
     }
-    return URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.resolvingSymlinksInPath().path
+    if let invoked = invokedExecutablePath(),
+       URL(fileURLWithPath: invoked).resolvingSymlinksInPath().path == current {
+        return invoked
+    }
+    return current
+}
+
+/// The path the user actually ran, without resolving a final symlink.
+private func invokedExecutablePath() -> String? {
+    let argument = CommandLine.arguments.first ?? ""
+    guard !argument.isEmpty else { return nil }
+
+    if argument.contains("/") {
+        let candidate = argument.hasPrefix("/")
+            ? URL(fileURLWithPath: argument)
+            : URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(argument)
+        let path = candidate.standardizedFileURL.path
+        return FileManager.default.isExecutableFile(atPath: path) ? path : nil
+    }
+
+    for directory in (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":") {
+        let path = URL(fileURLWithPath: String(directory)).appendingPathComponent(argument).path
+        if FileManager.default.isExecutableFile(atPath: path) { return path }
+    }
+    return nil
+}
+
+/// Stable executable paths to try when the running binary is in the Cellar.
+private func executableCandidates() -> [String] {
+    var candidates = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+        .split(separator: ":")
+        .map { URL(fileURLWithPath: String($0)).appendingPathComponent("pseudocopy").path }
+    candidates.append("/opt/homebrew/bin/pseudocopy")
+    candidates.append("/usr/local/bin/pseudocopy")
+    return candidates
 }
 
 /// The LaunchAgent plist (§5.2). All placeholders are absolute paths —
@@ -109,14 +162,18 @@ func executablePath() -> String {
 ///
 /// The plist is serialised by Foundation instead of being written by hand,
 /// so that paths containing `&` or `<` cannot produce an invalid file.
-func launchAgentPlist(binaryPath: String, watchDir: String, ttl: TimeInterval, home: String) throws -> Data {
+func launchAgentPlist(binaryPath: String, watchDir: String, ttl: TimeInterval, home: String,
+                      permanent: Bool) throws -> Data {
+    var arguments = [binaryPath, "run", "--dir", watchDir, "--ttl", String(ttl)]
+    if permanent {
+        // Freeze the deletion mode into the agent: `brew services` has no
+        // flags of its own, and a later `pseudocopy install --no-trash`
+        // must not silently lose the setting.
+        arguments.append("--no-trash")
+    }
     let plist: [String: Any] = [
         "Label": Constants.agentLabel,
-        "ProgramArguments": [
-            binaryPath, "run",
-            "--dir", watchDir,
-            "--ttl", String(ttl),
-        ],
+        "ProgramArguments": arguments,
         "RunAtLoad": true,
         "StartInterval": Int(Constants.cycleInterval),
         "ThrottleInterval": Int(Constants.cycleInterval),
@@ -134,11 +191,23 @@ func installAgent(config: Configuration) throws {
     let fileManager = FileManager.default
 
     // Two agents would double the clipboard traffic. If Homebrew already
-    // manages the service, the built-in install has to wait.
-    if let agent = Launchctl.loadedAgent(), Launchctl.isHomebrew(label: agent.name) {
+    // manages the service, the built-in install has to wait — and it must
+    // notice *every* Homebrew label, not whichever one launchctl lists first.
+    if let agent = Launchctl.loadedAgents().first(where: { Launchctl.isHomebrew(label: $0.name) }) {
         throw CLIError.usage("""
             a Homebrew-managed service is already running (\(agent.name)); \
             run 'brew services stop pseudocopy' first, or keep using brew services
+            """)
+    }
+
+    // A folder under /Volumes that is missing usually means the external
+    // volume is not mounted. Creating it would put a stray folder on the
+    // boot volume and the agent would watch the wrong place.
+    if config.watchDir.path.hasPrefix("/Volumes/"),
+       !fileManager.fileExists(atPath: config.watchDir.path) {
+        throw CLIError.usage("""
+            watch directory \(config.watchDir.path) is on an unmounted volume — \
+            mount it first, or choose a folder on the boot volume
             """)
     }
 
@@ -154,11 +223,23 @@ func installAgent(config: Configuration) throws {
     }
     try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: AgentPaths.logURL.path)
 
+    // Existing content is not copied retroactively, and anything older than
+    // the TTL will be reaped. Say so before arming the agent.
+    let existingFiles = (try? topLevelEntries(config.watchDir))?
+        .filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }
+        .count ?? 0
+    if existingFiles > 0 {
+        print("warning: \(config.watchDir.path) already contains \(existingFiles) file(s); "
+              + "files older than \(Int(config.ttl))s will be moved to the Trash")
+    }
+
+    let binary = executablePath()
     let plist = try launchAgentPlist(
-        binaryPath: executablePath(),
+        binaryPath: binary,
         watchDir: config.watchDir.path,
         ttl: config.ttl,
-        home: NSHomeDirectory()
+        home: NSHomeDirectory(),
+        permanent: config.permanent
     )
     let previousPlist = try? Data(contentsOf: AgentPaths.plistURL)
     try plist.write(to: AgentPaths.plistURL, options: [.atomic])
@@ -182,7 +263,8 @@ func installAgent(config: Configuration) throws {
     print("installed \(Constants.agentLabel)")
     print("  watch dir : \(config.watchDir.path)")
     print("  ttl       : \(Int(config.ttl))s")
-    print("  binary    : \(executablePath())")
+    print("  deletion  : \(config.permanent ? "permanent" : "Trash")")
+    print("  binary    : \(binary)")
     print("  plist     : \(AgentPaths.plistURL.path)")
     print("  log       : \(AgentPaths.logURL.path)")
 }
@@ -193,11 +275,11 @@ func installAgent(config: Configuration) throws {
 /// service belongs to `brew services` and is left alone.
 func uninstallAgent() throws {
     let hadPlist = FileManager.default.fileExists(atPath: AgentPaths.plistURL.path)
-    let builtInLoaded = Launchctl.loadedAgent()?.name == Constants.agentLabel
+    let builtInLoaded = Launchctl.loadedAgents().contains { $0.name == Constants.agentLabel }
 
     guard hadPlist || builtInLoaded else {
         print("nothing to uninstall — no agent was written by 'pseudocopy install'")
-        if let agent = Launchctl.loadedAgent(), Launchctl.isHomebrew(label: agent.name) {
+        if let agent = Launchctl.loadedAgents().first(where: { Launchctl.isHomebrew(label: $0.name) }) {
             print("  \(agent.name) is managed by Homebrew: brew services stop pseudocopy")
         }
         return
@@ -205,8 +287,13 @@ func uninstallAgent() throws {
 
     if builtInLoaded {
         let result = Launchctl.run(["bootout", Launchctl.label])
-        if result.status != 0 {
-            Logger.log(.info, "agent", "bootout: \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+        guard result.status == 0 else {
+            // Removing the plist while the job is still loaded would leave a
+            // running agent that cannot be unloaded cleanly until logout.
+            throw CLIError.usage("""
+                could not unload \(Constants.agentLabel): \
+                \(result.output.trimmingCharacters(in: .whitespacesAndNewlines)); the plist was kept
+                """)
         }
     }
     if hadPlist {
@@ -214,7 +301,7 @@ func uninstallAgent() throws {
     }
     print("uninstalled \(Constants.agentLabel)")
     print("  watch dir and state are kept")
-    if let agent = Launchctl.loadedAgent(), Launchctl.isHomebrew(label: agent.name) {
+    if let agent = Launchctl.loadedAgents().first(where: { Launchctl.isHomebrew(label: $0.name) }) {
         print("  note: \(agent.name) is managed by Homebrew: brew services stop pseudocopy")
     }
 }
@@ -222,9 +309,11 @@ func uninstallAgent() throws {
 /// Forces one cycle of the running agent right now (§5.3).
 func kickAgent() throws {
     guard let agent = Launchctl.loadedAgent() else {
-        throw CLIError.usage("pseudocopy is not loaded")
+        throw CLIError.usage("the agent is not loaded")
     }
-    let result = Launchctl.run(["kickstart", Launchctl.label(for: agent.name)])
+    // `-k` replaces a cycle that happens to be running, so a kick always
+    // produces a fresh look at the folder.
+    let result = Launchctl.run(["kickstart", "-k", Launchctl.label(for: agent.name)])
     guard result.status == 0 else {
         throw CLIError.usage("could not start a cycle of \(agent.name): \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))")
     }
@@ -233,12 +322,17 @@ func kickAgent() throws {
 
 /// Prints the agent status; exits 1 when the agent is not loaded (§5.3).
 func printAgentStatus() throws {
-    guard let agent = Launchctl.loadedAgent() else {
+    let agents = Launchctl.loadedAgents()
+    guard let agent = agents.first else {
         let names = ([Constants.agentLabel] + Constants.homebrewAgentLabels).joined(separator: ", ")
-        throw CLIError.usage("pseudocopy is not loaded (checked \(names))")
+        throw CLIError.usage("not loaded (checked \(names))")
     }
     print(agent.output.trimmingCharacters(in: .whitespacesAndNewlines))
     if Launchctl.isHomebrew(label: agent.name) {
         print("\nmanaged by Homebrew — use 'brew services' to start, stop or restart it")
+    }
+    if agents.count > 1 {
+        let others = agents.dropFirst().map { $0.name }.joined(separator: ", ")
+        print("\nwarning: more than one agent is loaded — also \(others)")
     }
 }
