@@ -55,7 +55,10 @@ enum Logger {
     /// Logs an event. `event` is one of the `LogEvent` kinds, `kind` a short
     /// label for the subject and `message` the detail.
     static func log(_ event: LogEvent, _ kind: String, _ message: String) {
-        let line = String(format: "%@ [%@] %-5@ %@", dateFormatter.string(from: Date()), event.rawValue, kind, message)
+        // The kind is padded to a fixed width so that the log stays aligned:
+        // "2026-10-20 14:03:12 [clip] text  ~/Temp/notes.txt"
+        let paddedKind = kind.count >= 5 ? kind : kind + String(repeating: " ", count: 5 - kind.count)
+        let line = "\(dateFormatter.string(from: Date())) [\(event.rawValue)] \(paddedKind) \(message)"
         FileHandle.standardError.write(Data((line + "\n").utf8))
     }
 

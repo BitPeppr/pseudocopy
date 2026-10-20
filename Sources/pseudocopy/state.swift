@@ -66,7 +66,7 @@ struct StateStore {
     mutating func save() throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(file)
         try data.write(to: stateFileURL, options: [.atomic])
     }
