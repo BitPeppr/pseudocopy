@@ -284,18 +284,6 @@ private func isSettledForReaping(record: StateRecord?, observed: Fingerprint, fo
     return false
 }
 
-/// The single most recently modified settled file, used when the state store
-/// had to be rebuilt and everything looks new at once.
-private func newestSettled(_ entries: [ScanEntry]) -> [ScanEntry] {
-    let settled = entries.filter { entry in
-        if case .settled = entry.verification { return true }
-        return false
-    }
-    guard let newest = settled.max(by: { ($0.modified ?? .distantPast) < ($1.modified ?? .distantPast) }) else {
-        return []
-    }
-    return [newest]
-}
 
 /// One watch + reap cycle (§2.1, §2.3, §4.3).
 func runCycle(config: Configuration) throws {
@@ -336,35 +324,46 @@ private func performCycle(config: Configuration, clipping: Bool, force: Bool) th
 
     // --- clip pass -------------------------------------------------------
     if clipping {
-        // After a state reset every file looks brand new. Clipping all of
-        // them at once would leave the clipboard with an arbitrary file, so
-        // only the newest one is copied in that cycle.
-        let clipCandidates = store.wasReset ? newestSettled(entries) : entries
-
-        for entry in clipCandidates {
-            guard case .settled = entry.verification, let current = entry.fingerprint else {
-                continue
+        if store.wasReset {
+            // The state was lost, so the tool cannot know which of these
+            // files are new. They are treated as already handled, so that the
+            // whole folder is not copied onto the clipboard one file after
+            // the other. A file that is downloaded again has a new fingerprint
+            // and is copied then.
+            for entry in entries {
+                guard let current = entry.fingerprint else { continue }
+                var record = records[entry.path] ?? StateRecord(lastFingerprint: current, clippedFingerprint: nil)
+                record.lastFingerprint = current
+                record.clippedFingerprint = current
+                records[entry.path] = record
             }
-            if records[entry.path]?.clippedFingerprint == current {
-                Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) already clipped")
-                continue
-            }
+            Logger.verboseLog(.scan, "state", "the state was rebuilt — the files that were already there are not copied")
+        } else {
+            for entry in entries {
+                guard case .settled = entry.verification, let current = entry.fingerprint else {
+                    continue
+                }
+                if records[entry.path]?.clippedFingerprint == current {
+                    Logger.verboseLog(.scan, "file", "\(displayPath(entry.url)) already clipped")
+                    continue
+                }
 
-            let kind = classifyFile(entry.url)
-            let written: FileKind
-            do {
-                written = try putOnClipboard(kind: kind, url: entry.url, embedLimit: config.embedLimitBytes)
-            } catch {
-                // The file stays unclipped and is retried on the next cycle.
-                Logger.log(.error, "clip", "\(displayPath(entry.url)): \(error.localizedDescription)")
-                continue
-            }
-            Logger.log(.clip, written.rawValue, displayPath(entry.url))
+                let kind = classifyFile(entry.url)
+                let written: FileKind
+                do {
+                    written = try putOnClipboard(kind: kind, url: entry.url, embedLimit: config.embedLimitBytes)
+                } catch {
+                    // The file stays unclipped and is retried on the next cycle.
+                    Logger.log(.error, "clip", "\(displayPath(entry.url)): \(error.localizedDescription)")
+                    continue
+                }
+                Logger.log(.clip, written.rawValue, displayPath(entry.url))
 
-            var record = records[entry.path] ?? StateRecord(lastFingerprint: current, clippedFingerprint: nil)
-            record.lastFingerprint = current
-            record.clippedFingerprint = current
-            records[entry.path] = record
+                var record = records[entry.path] ?? StateRecord(lastFingerprint: current, clippedFingerprint: nil)
+                record.lastFingerprint = current
+                record.clippedFingerprint = current
+                records[entry.path] = record
+            }
         }
     }
 
