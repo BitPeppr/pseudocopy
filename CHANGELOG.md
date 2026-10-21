@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [semantic versioning](https://semver.org/).
 
+## [1.2.1] — 2026-10-21
+
+### Fixed
+
+- **A UTF-8 BOM is stripped on macOS 14 as well.** `String(data:encoding:)`
+  drops a leading BOM on newer Foundation versions but keeps it as an
+  invisible U+FEFF on macOS 14. The byte-order mark is now removed
+  explicitly, so the pasted text is identical on every supported version.
+- **Xcode `.strings` files are recognized on every supported macOS version.**
+  On macOS 14 the extension has a known, non-plain-text UTI, so the
+  byte-based fallback never ran. `.strings`, `.stringsdict` and `.xcstrings`
+  are now explicit text extensions.
+
 ## [1.2.0] — 2026-10-21
 
 ### Added

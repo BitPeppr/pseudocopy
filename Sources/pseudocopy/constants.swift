@@ -4,7 +4,7 @@ import Foundation
 enum Constants {
     /// The released version. `Scripts/release.sh` reads this value and
     /// refuses to publish a tag that does not match it.
-    static let version = "1.2.0"
+    static let version = "1.2.1"
 
     /// Seconds between cycles when running in resident `loop` mode.
     /// The LaunchAgent uses the same value as its `StartInterval`.
@@ -136,6 +136,9 @@ enum ExtensionSets {
         "ts", "mts", "cts", "tsx", "jsx", "c", "h", "cc", "cpp", "hpp", "m",
         "mm", "java", "kt", "go", "rs", "sql", "diff", "patch", "tex", "srt",
         "vtt", "ics", "rst", "adoc", "properties", "asm", "edn",
+        // `.strings`/`.stringsdict` are Xcode text resources; on some macOS
+        // versions their registered UTI is known but not plain text.
+        "strings", "stringsdict", "xcstrings",
     ]
 
     /// Extensions treated as images.

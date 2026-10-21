@@ -22,6 +22,11 @@ struct FileInspection {
 /// The header of every PDF document.
 private let pdfMagic = Data("%PDF-".utf8)
 
+/// The UTF-8 byte-order mark. Stripped explicitly: newer Foundation versions
+/// drop it while decoding UTF-8, older ones keep it as U+FEFF. The pasted text
+/// must be the same on every supported macOS version.
+private let utf8BOM = Data([0xEF, 0xBB, 0xBF])
+
 /// How many bytes are read to identify a file. The PDF header is right at the
 /// start; the rest leaves room for the text heuristic.
 private let sniffLimit = 64 << 10
@@ -142,7 +147,8 @@ func decodeText(_ raw: Data) -> String? {
     }
     // A NUL byte means binary. UTF-16 without a BOM is not guessed either.
     guard !raw.contains(0) else { return nil }
-    return String(data: raw, encoding: .utf8)
+    let body = raw.starts(with: utf8BOM) ? raw.dropFirst(utf8BOM.count) : raw[...]
+    return String(data: body, encoding: .utf8)
 }
 
 /// True when the data starts with a UTF-16 byte-order mark (LE or BE).
