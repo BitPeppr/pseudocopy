@@ -96,14 +96,16 @@ The same works for anything else that writes into the folder — screenshots,
 `curl -O`, a drag-and-drop from the Finder.
 
 Text, images and PDFs are embedded in the pasteboard, so they survive the
-file being deleted an hour later. Text is pasted as text, an image as the
-image (the type is read from the bytes, not the name) and a PDF as the whole
-document. A PDF also carries a file reference — the complete file for apps
-that cannot take PDF data — and a multi-page PDF logs a warning, because
-macOS itself rasterises only the first page when a target asks for an image.
-Anything else is pasted as a file reference (so Finder creates a copy) plus,
-for files up to 64 MB, the raw bytes. A multi-file batch adds file references
-for every file so the Finder can copy them all.
+file being deleted an hour later. Text is pasted as text (normalized to
+UTF-8 — a UTF-8 BOM is removed and a BOM-marked UTF-16 file is transcoded),
+an image as the image (the type is read from the bytes, not the name) and a
+PDF as the whole document. A PDF also carries a file reference — the complete
+file for apps that cannot take PDF data — and a multi-page PDF logs a
+warning, because macOS itself rasterises only the first page when a target
+asks for an image. A TIFF with several equal-sized pages gets the same file
+reference and warning. Anything else is pasted as a file reference (so Finder
+creates a copy) plus, for files up to 64 MB, the raw bytes. A multi-file
+batch adds file references for every file so the Finder can copy them all.
 
 > **Use a dedicated folder.** Everything in the *top level* of the watch
 > folder is subject to the one hour reaper — do not point `pseudocopy` at a
@@ -219,23 +221,29 @@ needs two identical readings.
 
 | File | Pasteboard representation |
 |---|---|
-| **Text** — the extension list, or a file with no meaningful extension whose bytes are UTF-8 | the text, under both `public.utf8-plain-text` and `public.plain-text` |
-| **Image** — whatever ImageIO can decode (PNG, JPEG, GIF, TIFF, HEIC, WebP, BMP, AVIF, …) | the image bytes, under the type the *content* is; AppKit adds a TIFF for older apps |
+| **Text** — the extension list, a plain-text UTI macOS knows, or a file with no meaningful extension whose bytes are text | the text, normalized to UTF-8, under both `public.utf8-plain-text` and `public.plain-text` |
+| **Image** — whatever ImageIO can decode (PNG, JPEG, GIF, TIFF, HEIC, WebP, BMP, AVIF, …) | the image bytes, under the type the *content* is; AppKit adds a TIFF for older apps. A multi-page TIFF with equal page sizes also carries a file reference |
 | **PDF** | the whole document under `com.adobe.pdf`, plus a `public.file-url` for apps that cannot take PDF data |
-| **Other** | `public.file-url` (plus the legacy Finder file list) and, up to 64 MB, the raw bytes under the file's UTI |
+| **Other** | `public.file-url` (plus the legacy Finder file list) and, up to 64 MB, the raw bytes under its UTI (`public.data` when the extension is unknown) |
 
 The content wins over the name: a PNG called `.jpg` is advertised as
 `public.png`, and a WebP download is pasted as an image, not as a file. A
 binary file is never pasted as text — a NUL byte rules it out — and a file
-with no extension is pasted as text only when its bytes are valid UTF-8
-(`Dockerfile`, `Makefile`, `LICENSE`).
+with no extension (or an unknown one) is pasted as text when its bytes are
+UTF-8 or BOM-marked UTF-16 (`Dockerfile`, `Makefile`, `LICENSE`). An
+extension that claims to be an image but whose bytes ImageIO cannot decode is
+treated as a file, not advertised as a broken image. Text in an encoding
+without a BOM (Latin-1, Windows-1252, Shift-JIS, …) is offered as a file
+rather than guessed.
 
 A PDF is the one case where the format itself limits what an app can show:
 macOS rasterises a PDF to a single image when the target cannot take PDF
 data, and that image is always page 1. Pseudocopy keeps every page in the
 PDF representation, offers the file itself as a second representation, and
 logs a warning for a document with more than one page. To get all pages,
-paste into a PDF-aware app (Preview, Pages, Word) or as a file.
+paste into a PDF-aware app (Preview, Pages, Word) or as a file. A TIFF with
+several equal-sized pages has the same first-frame limitation and gets the
+same file reference and warning.
 
 An old file that arrives after the state exists (one that was copied in with
 an older timestamp) is copied to the clipboard as well and then removed from
@@ -306,12 +314,17 @@ Add `--verbose` for a line per cycle (handy while developing with
 - macOS rasterises a PDF to its **first page** when the target only accepts
   images. Pseudocopy keeps the whole document, offers the file itself and
   logs a warning for a multi-page PDF; paste into a PDF-aware app or as a
-  file to get every page. A multi-page TIFF has the same limitation: the
-  image target sees the first frame.
+  file to get every page. A TIFF with several equal-sized pages gets the same
+  file reference and warning, but an image-only target still receives the
+  first frame.
 - Text files are only pasted as text up to 16 MB — bigger ones are offered
   as a file reference instead, because the bytes would cost about three
-  times their size in memory. Images and PDFs are not materialised above
-  256 MB.
+  times their size in memory. The limit applies to the UTF-8 text on the
+  pasteboard: a BOM-marked UTF-16 file is measured after transcoding.
+  Images and PDFs are not materialised above 256 MB.
+- Text is recognized as UTF-8 (with or without a BOM) or as BOM-marked
+  UTF-16. Other encodings (Latin-1, Windows-1252, Shift-JIS, …) are not
+  guessed; such a file is offered as a file reference plus its raw bytes.
 - Very large files are best kept out of this folder: everything is copied
   into the clipboard, which lives in RAM. Nothing breaks, it is just
   wasteful.
@@ -342,7 +355,10 @@ Scripts/release.sh          # universal binary + GitHub release (maintainers)
 folder and checks clipping, reaping, the exclusion rules (partial downloads,
 dotfiles, directories, symlinks), the process lock, and the safety paths
 (unreadable files, a damaged state file, missing external-volume paths and
-the watch-directory guards). It compiles
+the watch-directory guards). It also covers UTF-16, a UTF-8 BOM, a
+legacy-encoded text file, empty and mislabelled files, multi-page PDFs and
+TIFFs, and that `clip` refuses devices and FIFOs without blocking. It
+compiles
 [`Scripts/pasteboard_inspector.swift`](Scripts/pasteboard_inspector.swift) to
 assert the exact pasteboard representation of every file type, and it
 snapshots and restores the *whole* clipboard (not only its text). It uses a
@@ -353,25 +369,36 @@ is described in [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md).
 
 ### Deviations from PLAN.md
 
-`PLAN.md` is normative. Four clipboard rules were extended after real-world
+`PLAN.md` is normative. Five clipboard rules were extended after real-world
 testing; everything else follows the plan, and the phase-by-phase build log
 is in the git history.
 
-1. **Classification is content-first.** §2.2 decides the type by extension;
-   pseudocopy checks the PDF header (CoreGraphics) and lets ImageIO identify
-   images before falling back to the extension lists. Both are system
-   frameworks that AppKit already links — there is still no third-party
-   dependency. This is what makes a mislabelled image, WebP/BMP and
-   extensionless text work.
+1. **Classification is content-first and type-aware.** §2.2 decides the type
+   by extension; pseudocopy checks the PDF header (CoreGraphics) and lets
+   ImageIO identify images before falling back to the extension lists. An
+   extension that macOS already registers as plain text (a
+   `public.plain-text`-conforming UTI) counts as text even when it is not in
+   §7.2's list — Fortran, Pascal, Ada, Make, … are covered that way. A file
+   whose bytes contradict its name — a text file named `.png`, an image
+   ImageIO cannot decode — is offered as generic data and a file reference
+   instead of a broken image. Dynamic UTIs (`dyn.…`) are reported as
+   `public.data`, because no app can ask for them.
 2. **Text is written under two UTIs.** §2.2 names only
    `public.utf8-plain-text`; `public.plain-text` is written alongside it so
    apps using the modern identifier get the text.
 3. **A PDF also carries a file reference.** §2.2 gives a PDF only the
    `com.adobe.pdf` data. Without the file URL, an app that cannot take PDF
-   data lets macOS rasterise page 1, and the other pages are lost.
-4. **Extensionless UTF-8 files are text.** §2.2's text set is a fixed
-   extension list; a file whose extension is unknown (or absent) is treated
-   as text when its bytes are valid UTF-8 without NUL bytes.
+   data lets macOS rasterise page 1, and the other pages are lost. A TIFF
+   with several equal-sized pages gets the same treatment.
+4. **Extensionless and unknown-extension files are text when their bytes
+   are.** §2.2's text set is a fixed extension list; a file whose extension
+   is unknown (or absent) is treated as text when its bytes are UTF-8 without
+   NUL bytes, or BOM-marked UTF-16.
+5. **Text is normalized to UTF-8.** A UTF-8 BOM is removed and a BOM-marked
+   UTF-16 file is transcoded before it is written. §2.2 says "the file's
+   bytes"; writing them unchanged would paste a BOM as an invisible
+   character and would make a UTF-16 `.txt` or `.csv` unusable. Encodings
+   without a BOM are deliberately not guessed.
 
 The smoke test asserts each of these, so the behaviour cannot regress
 silently.

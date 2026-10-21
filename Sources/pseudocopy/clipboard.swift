@@ -46,7 +46,7 @@ struct ClipPayload {
     var uti: String?
     /// The embedded bytes.
     var data: Data?
-    /// Page count of a PDF, when it could be read.
+    /// Page count of a PDF or a multi-page TIFF, when it could be read.
     var pageCount: Int?
 }
 
@@ -152,7 +152,7 @@ private func payload(for inspection: FileInspection, url: URL, limits: ClipLimit
     guard let size = fileSize(of: url) else {
         // A file whose size cannot be read is not safe to read into memory:
         // retry on the next cycle instead of bypassing the limits.
-        throw ClipboardError.writeFailed("could not read the size of \(url.lastPathComponent)")
+        throw ClipboardError.writeFailed("could not read the file size")
     }
 
     switch inspection.kind {
@@ -168,15 +168,28 @@ private func payload(for inspection: FileInspection, url: URL, limits: ClipLimit
             // memory budget: offer the file reference instead.
             return ClipPayload(kind: .other, url: url, uti: nil, data: nil, pageCount: nil)
         }
-        // The bytes are written unchanged (§2.2), but they have to be valid
-        // UTF-8 — otherwise this falls through to the generic handling.
-        guard String(data: raw, encoding: .utf8) != nil else {
-            return ClipPayload(kind: .other, url: url, uti: uti(for: url), data: raw, pageCount: nil)
+        // The text is normalized to UTF-8: a UTF-8 BOM is dropped and a
+        // BOM-marked UTF-16 file is transcoded. Bytes that are not text at all
+        // fall through to the generic representation.
+        guard let text = decodeText(raw) else {
+            return ClipPayload(kind: .other, url: url, uti: binaryUTI(for: url),
+                               data: raw, pageCount: nil)
+        }
+        let encoded = Data(text.utf8)
+        // UTF-16 expands when it becomes UTF-8; a file that no longer fits the
+        // text budget is offered as a file reference instead.
+        guard encoded.count <= limits.text else {
+            return ClipPayload(kind: .other, url: url, uti: nil, data: nil, pageCount: nil)
         }
         return ClipPayload(kind: .text, url: url, uti: UTType.utf8PlainText.identifier,
-                           data: raw, pageCount: nil)
+                           data: encoded, pageCount: nil)
 
     case .image, .pdf:
+        // An empty file has no content to paste; the file reference is the
+        // only useful representation.
+        guard size > 0 else {
+            return ClipPayload(kind: .other, url: url, uti: nil, data: nil, pageCount: nil)
+        }
         guard size <= limits.materialise else {
             // Too big to materialise: the file reference is the best that can
             // be offered.
@@ -186,12 +199,16 @@ private func payload(for inspection: FileInspection, url: URL, limits: ClipLimit
             return ClipPayload(kind: .other, url: url, uti: nil, data: nil, pageCount: nil)
         }
         // `inspection.uti` is the type the bytes really are. The extension is
-        // only a fallback for an image that ImageIO could not decode.
+        // only a fallback for a PDF whose header could not be read.
         return ClipPayload(kind: inspection.kind, url: url,
                            uti: inspection.uti ?? uti(for: url), data: data,
                            pageCount: inspection.pageCount)
 
     case .other:
+        // A zero-byte file has no bytes to offer under any type.
+        guard size > 0 else {
+            return ClipPayload(kind: .other, url: url, uti: nil, data: nil, pageCount: nil)
+        }
         guard size <= limits.embed else {
             // A file over the limit is never embedded, so it never has to be
             // read into memory at all.
@@ -221,20 +238,21 @@ private func readCapped(_ url: URL, limit: Int) throws -> Data? {
 
 /// Writes prepared payloads in a single pasteboard transaction.
 ///
-/// A single text or image only carries its own representation (§2.2). A PDF
-/// also carries a file reference: the document data is complete, but macOS
-/// coerces a PDF to an image by rasterising **the first page only**, so any
-/// app that cannot take PDF data would silently lose the other pages. The file
-/// reference lets those apps (and the Finder) get the whole document. File
-/// references are also added for a generic ("Other") file — which has no
-/// previewable content — and for a multi-file batch, where they are the only
-/// way to offer every file. A pasteboard holds one value per type, so only the
-/// first file of each type contributes bytes.
+/// A single text or image only carries its own representation (§2.2). A PDF —
+/// and a TIFF with several equal-sized pages — also carries a file reference:
+/// the document data is complete, but macOS coerces it to a single image (the
+/// first page/frame), so any app that cannot take the document data would
+/// silently lose the other pages. The file reference lets those apps (and the
+/// Finder) get the whole document. File references are also added for a
+/// generic ("Other") file — which has no previewable content — and for a
+/// multi-file batch, where they are the only way to offer every file. A
+/// pasteboard holds one value per type, so only the first file of each type
+/// contributes bytes.
 private func writeClipPayloads(_ payloads: [ClipPayload]) throws {
     guard !payloads.isEmpty else { return }
 
     let includeFileReferences = payloads.count > 1
-        || payloads.contains { $0.kind == .other || $0.kind == .pdf }
+        || payloads.contains { $0.kind == .other || $0.kind == .pdf || ($0.pageCount ?? 0) > 1 }
 
     // Everything is prepared on independent `NSPasteboardItem`s first. The
     // system pasteboard is cleared only after every item has been built, so a
@@ -272,12 +290,14 @@ private func writeClipPayloads(_ payloads: [ClipPayload]) throws {
         throw ClipboardError.writeFailed("pasteboard transaction")
     }
 
-    // A multi-page PDF is complete on the pasteboard, but an app that only
-    // accepts images still receives the rasterised first page. Say so instead
-    // of letting the other pages disappear silently.
+    // A multi-page document is complete on the pasteboard, but an app that
+    // only accepts images still receives the rasterised first page. Say so
+    // instead of letting the other pages disappear silently — for a PDF and
+    // for a TIFF with several equal-sized pages.
     for payload in payloads {
-        guard payload.kind == .pdf, let pages = payload.pageCount, pages > 1 else { continue }
-        Logger.log(.info, "pdf",
+        guard let pages = payload.pageCount, pages > 1 else { continue }
+        let kind = payload.kind == .pdf ? "pdf" : "image"
+        Logger.log(.info, kind,
                    "\(displayPath(payload.url)) has \(pages) pages — an app that only accepts images receives the first page")
     }
 }

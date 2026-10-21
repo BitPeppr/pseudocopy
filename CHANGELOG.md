@@ -4,6 +4,60 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [semantic versioning](https://semver.org/).
 
+## [1.2.0] — 2026-10-21
+
+### Added
+
+- **UTF-16 text files are pasted as text.** A `.txt`, `.csv` or any other
+  text file saved with a UTF-16 BOM used to fall through to *Other* (or put
+  its UTF-16 bytes under a text type). It is now transcoded to UTF-8, so the
+  text is pasted correctly. A UTF-8 BOM is removed for the same reason: it
+  used to become an invisible character at the start of the paste.
+- **More text types are recognized.** An extension whose macOS UTI already
+  conforms to `public.plain-text` counts as text without being in the
+  hard-coded list (Fortran, Pascal, Ada, Make, …), and `.asm`, `.edn`,
+  `.ndjson`, `.geojson`, `.mts`, `.cjs` and `.cts` were added explicitly.
+  `.mts` is also a video extension; the bytes still decide, so a real MPEG
+  transport stream keeps its file representation and is not pasted as text.
+- **A multi-page TIFF is completed like a PDF.** A TIFF whose pages have the
+  same dimensions now carries a file reference (the whole document) and logs
+  the same first-page warning. A single-page TIFF — and a TIFF whose second
+  IFD is only a thumbnail — is unchanged.
+- `clip` refuses devices and FIFOs instead of blocking on them.
+
+### Fixed
+
+- **Empty images and PDFs are no longer advertised as content.** A zero-byte
+  `.png` or `.pdf` used to be written as an empty image/document; it now
+  carries only a file reference.
+- **An image extension whose bytes are not an image is no longer advertised
+  as one.** A text or damaged file named `.png`/`.jpg`/… falls back to a file
+  reference plus `public.data` instead of handing broken bytes to an
+  image-aware app.
+- **A `.txt` containing NUL bytes is no longer pasted as text.** It is a
+  binary file and is offered as a file.
+- **A failed text file can no longer shadow a valid one in the same batch.**
+  The fallback representation uses `public.data` for text-typed extensions,
+  so an invalid `.txt` and a valid `.txt` no longer collide on
+  `public.plain-text`.
+- **Unknown extensions use `public.data`, not a dynamic UTI.** A dynamic
+  `dyn.…` identifier is unique to the extension and no app can request it;
+  the raw bytes are now offered under `public.data` (the file reference is
+  unchanged).
+- **Control characters in a file name can no longer corrupt the log.** Tabs,
+  newlines, escape sequences, C1 controls and Unicode line separators are
+  escaped in every log line, so a downloaded name cannot inject a terminal
+  escape or a fake log entry.
+
+### Changed
+
+- The README documents the new text handling, the image/file fallbacks and
+  the fifth deviation from `PLAN.md`.
+- The smoke test covers UTF-16 and BOM handling, legacy encodings, NUL
+  bytes, empty and mislabelled files, SVG/RTF, unknown extensions, binary
+  `.ts`, the batch text collision, devices/FIFOs, log escaping and
+  multi-page TIFFs.
+
 ## [1.1.0] — 2026-10-21
 
 ### Fixed

@@ -648,6 +648,225 @@ else
     pass "an extensionless binary file is not pasted as text"
 fi
 
+# --- text encodings and type edge cases -------------------------------------
+echo "==> text encodings and edge cases"
+if python3 - "${TYPES}" <<'PY'
+import pathlib, sys
+
+root = pathlib.Path(sys.argv[1])
+(root / "utf16.txt").write_bytes(b"\xff\xfe" + "windows text\n".encode("utf-16-le"))
+(root / "utf8bom.txt").write_bytes(b"\xef\xbb\xbfbom text\n")
+(root / "latin1.txt").write_bytes(b"caf\xe9\n")
+(root / "binary.txt").write_bytes(b"nul\x00here")
+(root / "empty.txt").write_bytes(b"")
+(root / "empty.png").write_bytes(b"")
+(root / "misnamed.png").write_bytes(b"this is text\n")
+(root / "script.asm").write_text("mov eax, 1\n")
+(root / "data.ndjson").write_text('{"a":1}\n')
+(root / "data.geojson").write_text('{"type":"Feature"}\n')
+(root / "clip.mts").write_text("export const x = 1\n")
+(root / "Localizable.strings").write_bytes(b"\xff\xfe" + 'hello = "world";\n'.encode("utf-16-le"))
+(root / "plain.f90").write_text("program hello\nend program hello\n")
+(root / "sample.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"></svg>\n')
+(root / "sample.rtf").write_text('{\\rtf1 hello}\n')
+(root / "mystery.xyzzy").write_bytes(b"\x01\x02\x00\x03")
+(root / "movie.ts").write_bytes(bytes([0x47, 0, 0, 0x10]) * 8)
+PY
+then
+    pass "the encoding and edge-case fixtures are written"
+else
+    fail "the encoding and edge-case fixtures are written"
+fi
+
+# A UTF-16 file with a BOM is transcoded: the pasteboard only carries UTF-8.
+"${BIN}" clip "${TYPES}/utf16.txt" >/dev/null 2>&1
+check_eq "a UTF-16 text file is transcoded" "windows text" "$(pb_string public.plain-text)"
+check_eq "the transcoded text is UTF-8 (13 bytes)" "13" "$(pb_size public.plain-text)"
+
+# A UTF-8 BOM must not become an invisible character in the pasted text.
+"${BIN}" clip "${TYPES}/utf8bom.txt" >/dev/null 2>&1
+check_eq "a UTF-8 BOM is removed" "bom text" "$(pb_string public.plain-text)"
+check_eq "the BOM is not pasted as a character (9 bytes)" "9" "$(pb_size public.plain-text)"
+
+# Legacy encodings are not guessed: the file stays a file.
+"${BIN}" clip "${TYPES}/latin1.txt" >/dev/null 2>&1
+if pb_file_urls | grep -q "latin1.txt"; then
+    pass "a legacy-encoded text file keeps a file reference"
+else
+    fail "a legacy-encoded text file keeps a file reference"
+fi
+if pb_has public.plain-text || pb_has public.utf8-plain-text; then
+    fail "a legacy-encoded text file is not pasted as UTF-8"
+else
+    pass "a legacy-encoded text file is not pasted as UTF-8"
+fi
+
+# A NUL byte still rules a .txt out.
+"${BIN}" clip "${TYPES}/binary.txt" >/dev/null 2>&1
+if pb_file_urls | grep -q "binary.txt"; then
+    pass "a NUL-containing .txt keeps a file reference"
+else
+    fail "a NUL-containing .txt keeps a file reference"
+fi
+if pb_has public.plain-text || pb_has public.utf8-plain-text; then
+    fail "a NUL-containing .txt is not pasted as text"
+else
+    pass "a NUL-containing .txt is not pasted as text"
+fi
+
+# An empty text file is still text; an empty image has no content to offer.
+"${BIN}" clip "${TYPES}/empty.txt" >/dev/null 2>&1
+if pb_has public.plain-text && [[ "$(pb_size public.plain-text)" == "0" ]]; then
+    pass "an empty .txt is pasted as empty text"
+else
+    fail "an empty .txt is pasted as empty text"
+fi
+if pb_has public.file-url; then
+    fail "an empty .txt carries no file reference"
+else
+    pass "an empty .txt carries no file reference"
+fi
+
+"${BIN}" clip "${TYPES}/empty.png" >/dev/null 2>&1
+if pb_file_urls | grep -q "empty.png"; then
+    pass "an empty image carries a file reference"
+else
+    fail "an empty image carries a file reference"
+fi
+if pb_has public.png; then
+    fail "an empty image is not advertised as an image"
+else
+    pass "an empty image is not advertised as an image"
+fi
+
+# An image extension whose bytes are not an image is a file, not a broken image.
+"${BIN}" clip "${TYPES}/misnamed.png" >/dev/null 2>&1
+if pb_has public.png; then
+    fail "text named .png is not advertised as PNG"
+else
+    pass "text named .png is not advertised as PNG"
+fi
+if pb_file_urls | grep -q "misnamed.png" && pb_has public.data; then
+    pass "text named .png is offered as generic data and a file"
+else
+    fail "text named .png is offered as generic data and a file"
+fi
+
+# Text formats whose registered UTI is not plain text still count as text.
+"${BIN}" clip "${TYPES}/script.asm" >/dev/null 2>&1
+check_eq "an .asm file is text" "mov eax, 1" "$(pb_string public.plain-text)"
+"${BIN}" clip "${TYPES}/data.ndjson" >/dev/null 2>&1
+check_eq "a .ndjson file is text" '{"a":1}' "$(pb_string public.plain-text)"
+"${BIN}" clip "${TYPES}/data.geojson" >/dev/null 2>&1
+check_eq "a .geojson file is text" '{"type":"Feature"}' "$(pb_string public.plain-text)"
+"${BIN}" clip "${TYPES}/clip.mts" >/dev/null 2>&1
+check_eq "a .mts text file is text" "export const x = 1" "$(pb_string public.plain-text)"
+
+# macOS already knows that these extensions are plain text.
+"${BIN}" clip "${TYPES}/plain.f90" >/dev/null 2>&1
+check_eq "a Fortran source file is text" "program hello" "$(pb_string public.plain-text | head -1)"
+
+# A BOM-marked UTF-16 file whose extension is unknown is text as well.
+"${BIN}" clip "${TYPES}/Localizable.strings" >/dev/null 2>&1
+check_eq "a UTF-16 .strings file is text" 'hello = "world";' "$(pb_string public.plain-text)"
+
+# RTF and SVG are documents, not plain text.
+"${BIN}" clip "${TYPES}/sample.svg" >/dev/null 2>&1
+if pb_has public.svg-image && pb_file_urls | grep -q "sample.svg"; then
+    pass "an SVG keeps its type and a file reference"
+else
+    fail "an SVG keeps its type and a file reference"
+fi
+if pb_has public.utf8-plain-text; then
+    fail "SVG source is not pasted as plain text"
+else
+    pass "SVG source is not pasted as plain text"
+fi
+
+"${BIN}" clip "${TYPES}/sample.rtf" >/dev/null 2>&1
+if pb_has public.rtf && pb_file_urls | grep -q "sample.rtf"; then
+    pass "an RTF keeps its type and a file reference"
+else
+    fail "an RTF keeps its type and a file reference"
+fi
+
+# An unknown extension is advertised as public.data, not as a dynamic UTI.
+"${BIN}" clip "${TYPES}/mystery.xyzzy" >/dev/null 2>&1
+if pb_has public.data && pb_file_urls | grep -q "mystery.xyzzy"; then
+    pass "an unknown binary extension is public.data"
+else
+    fail "an unknown binary extension is public.data"
+fi
+
+# `.ts` is also an MPEG transport stream: the bytes must decide, not the name.
+"${BIN}" clip "${TYPES}/movie.ts" >/dev/null 2>&1
+if pb_has public.mpeg-2-transport-stream && ! pb_has public.plain-text; then
+    pass "a binary .ts is not pasted as text"
+else
+    fail "a binary .ts is not pasted as text"
+fi
+
+# A failed text file must not shadow the valid text in the same batch.
+"${BIN}" clip "${TYPES}/latin1.txt" "${TYPES}/notes.txt" >/dev/null 2>&1
+check_eq "a failed text does not shadow a valid one" "first line" "$(pb_string public.utf8-plain-text | head -1)"
+check_eq "the valid text is also the plain-text value" "first line" "$(pb_string public.plain-text | head -1)"
+
+# `clip` must never block on a device or a FIFO.
+if "${BIN}" clip /dev/null >/dev/null 2>&1; then
+    fail "clip refuses a device"
+else
+    pass "clip refuses a device"
+fi
+mkfifo "${TYPES}/a-fifo"
+START="$(date +%s)"
+perl -e 'alarm 10; exec @ARGV' "${BIN}" clip "${TYPES}/a-fifo" >/dev/null 2>&1
+STATUS=$?
+ELAPSED=$(( $(date +%s) - START ))
+if [[ "${STATUS}" -eq 1 && "${ELAPSED}" -lt 5 ]]; then
+    pass "clip refuses a FIFO without blocking"
+else
+    fail "clip refuses a FIFO without blocking (status ${STATUS}, ${ELAPSED}s)"
+fi
+rm -f "${TYPES}/a-fifo"
+
+# Control characters in a file name cannot inject a terminal escape into the log.
+ESCAPE_NAME=$'escape-\x1b[31mred.txt'
+printf 'escape test\n' > "${TYPES}/${ESCAPE_NAME}"
+"${BIN}" clip "${TYPES}/${ESCAPE_NAME}" > "${LOG_DIR}/escape.log" 2>&1
+if grep -Fq '\u{1B}' "${LOG_DIR}/escape.log" && ! LC_ALL=C grep -q $'\x1b' "${LOG_DIR}/escape.log"; then
+    pass "a control character in a file name is escaped in the log"
+else
+    fail "a control character in a file name is escaped in the log"
+fi
+
+# A multi-page TIFF gets the PDF treatment: the whole file, plus a warning.
+if command -v sips >/dev/null 2>&1 && command -v tiffutil >/dev/null 2>&1; then
+    if sips -s format tiff "${TYPES}/pixel.png" --out "${TYPES}/one-page.tiff" >/dev/null 2>&1 \
+       && tiffutil -cat "${TYPES}/one-page.tiff" "${TYPES}/one-page.tiff" -out "${TYPES}/two-pages.tiff" >/dev/null 2>&1; then
+        "${BIN}" clip "${TYPES}/one-page.tiff" >/dev/null 2>&1
+        if pb_has public.file-url; then
+            fail "a single-page TIFF carries no file reference"
+        else
+            pass "a single-page TIFF carries no file reference"
+        fi
+        "${BIN}" clip "${TYPES}/two-pages.tiff" > "${LOG_DIR}/clip-tiff.log" 2>&1
+        if pb_file_urls | grep -q "two-pages.tiff"; then
+            pass "a multi-page TIFF carries a file reference"
+        else
+            fail "a multi-page TIFF carries a file reference"
+        fi
+        if grep -q "has 2 pages" "${LOG_DIR}/clip-tiff.log"; then
+            pass "the multi-page TIFF warning is logged"
+        else
+            fail "the multi-page TIFF warning is logged"
+        fi
+    else
+        fail "the TIFF fixtures could not be built"
+    fi
+else
+    info "sips/tiffutil unavailable — skipping the multi-page TIFF checks"
+fi
+
 # --- result -----------------------------------------------------------------
 echo
 if [[ "${FAILURES}" -eq 0 ]]; then

@@ -46,7 +46,7 @@ struct ScanEntry {
 // MARK: - Classification
 
 // `classifyFile` lives in filetype.swift: a file is identified from its
-// content (PDF header, ImageIO, UTF-8 heuristic) and only falls back to its
+// content (PDF header, ImageIO, text decoding) and only falls back to its
 // extension. This file stays free of the pasteboard frameworks.
 
 /// True when the file name carries a partial-download marker (§2.1).
@@ -131,10 +131,29 @@ func canonicalPath(_ url: URL) -> String {
     return standardized.path
 }
 
+/// Escapes control characters so a file name cannot break the one-line log
+/// format or inject terminal escape sequences into a displayed log.
+func logEscaped(_ text: String) -> String {
+    var result = ""
+    for scalar in text.unicodeScalars {
+        switch scalar.value {
+        case 0x0A: result += "\\n"
+        case 0x0D: result += "\\r"
+        case 0x09: result += "\\t"
+        case 0x00..<0x20, 0x7F..<0xA0, 0x2028, 0x2029:
+            result += String(format: "\\u{%02X}", scalar.value)
+        default:
+            result.unicodeScalars.append(scalar)
+        }
+    }
+    return result
+}
+
 /// Human readable path, with the home directory abbreviated to `~`.
 ///
-/// Newlines and tabs are escaped: a file name may contain them, and they
-/// would break the one-line-per-event log format (§2.5).
+/// Newlines, tabs and other control characters are escaped: a file name may
+/// contain them, and they would break the one-line-per-event log format (§2.5)
+/// or manipulate the terminal that shows the log.
 func displayPath(_ url: URL) -> String {
     let path = url.path
     let home = NSHomeDirectory()
@@ -146,10 +165,7 @@ func displayPath(_ url: URL) -> String {
     } else {
         shown = path
     }
-    return shown
-        .replacingOccurrences(of: "\n", with: "\\n")
-        .replacingOccurrences(of: "\r", with: "\\r")
-        .replacingOccurrences(of: "\t", with: "\\t")
+    return logEscaped(shown)
 }
 
 // MARK: - Process lock (§2.6)
@@ -640,7 +656,16 @@ func clipPaths(_ paths: [String], config: Configuration) throws {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
             // One bad path does not stop the others.
-            Logger.log(.error, "clip", "not a file: \(path)")
+            Logger.log(.error, "clip", "not a file: \(logEscaped(path))")
+            failures += 1
+            continue
+        }
+        // Only regular files: opening a FIFO would block, and a device could
+        // stream forever. The watch folder already filters these out; `clip`
+        // takes arbitrary paths and must not hang on one.
+        let isRegular = (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
+        guard isRegular else {
+            Logger.log(.error, "clip", "not a regular file: \(logEscaped(path))")
             failures += 1
             continue
         }

@@ -4,7 +4,7 @@ import Foundation
 enum Constants {
     /// The released version. `Scripts/release.sh` reads this value and
     /// refuses to publish a tag that does not match it.
-    static let version = "1.1.0"
+    static let version = "1.2.0"
 
     /// Seconds between cycles when running in resident `loop` mode.
     /// The LaunchAgent uses the same value as its `StartInterval`.
@@ -115,19 +115,27 @@ enum Logger {
 /// lists are the fallback for files that cannot be identified, and they decide
 /// which extensions are text without having to read the whole file.
 enum ExtensionSets {
-    /// Extensions treated as UTF-8 text. Anything that fails to decode as
-    /// UTF-8 falls through to the generic *Other* representation.
+    /// Extensions treated as text. Anything that cannot be decoded as text
+    /// falls through to the generic *Other* representation.
+    ///
+    /// Most plain-text types do not need to be listed: macOS already assigns
+    /// them a `public.plain-text`-conforming UTI, and an extension that is
+    /// merely dynamic is decided by the bytes. The entries below are the
+    /// exceptions — text formats whose registered UTI is *not* plain text
+    /// (`asm`, `edn`, `ndjson`, `geojson`, `mts`) — plus the common cases that
+    /// make the intent obvious.
     ///
     /// "rtf" is deliberately absent: RTF is not UTF-8 text, pasting it as
     /// plain text would put the markup on the clipboard instead of the
     /// document.
     static let text: Set<String> = [
         "txt", "text", "md", "markdown", "log", "csv", "tsv", "json", "jsonl",
-        "yaml", "yml", "toml", "ini", "cfg", "conf", "plist", "xml", "html",
-        "htm", "css", "scss", "sh", "bash", "zsh", "fish", "py", "rb", "php",
-        "pl", "lua", "swift", "js", "mjs", "ts", "tsx", "jsx", "c", "h", "cc",
-        "cpp", "hpp", "m", "mm", "java", "kt", "go", "rs", "sql", "diff",
-        "patch", "tex", "srt", "vtt", "ics", "rst", "adoc", "properties",
+        "ndjson", "geojson", "yaml", "yml", "toml", "ini", "cfg", "conf",
+        "plist", "xml", "html", "htm", "css", "scss", "sh", "bash", "zsh",
+        "fish", "py", "rb", "php", "pl", "lua", "swift", "js", "mjs", "cjs",
+        "ts", "mts", "cts", "tsx", "jsx", "c", "h", "cc", "cpp", "hpp", "m",
+        "mm", "java", "kt", "go", "rs", "sql", "diff", "patch", "tex", "srt",
+        "vtt", "ics", "rst", "adoc", "properties", "asm", "edn",
     ]
 
     /// Extensions treated as images.
