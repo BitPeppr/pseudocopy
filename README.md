@@ -77,13 +77,47 @@ install.
 
 ## Uninstall
 
+### Homebrew
+
 ```sh
-pseudocopy uninstall          # or: ~/bin/pseudocopy uninstall
+brew services stop pseudocopy
+brew uninstall pseudocopy
 ```
 
-This removes the LaunchAgent and its plist. The watch folder and the state
-store (`~/Library/Application Support/pseudocopy/`) are kept, so reinstalling
-with the same folder preserves the history.
+`brew services stop` unloads the agent and removes its plist;
+`brew uninstall` removes the binary. If nothing else uses the tap, remove it
+too:
+
+```sh
+brew untap BitPeppr/tap
+```
+
+### From source or a manual install
+
+```sh
+pseudocopy uninstall          # or: ~/bin/pseudocopy uninstall
+rm ~/bin/pseudocopy           # if Scripts/install.sh installed it there
+```
+
+`pseudocopy uninstall` removes only the LaunchAgent written by
+`pseudocopy install`. It deliberately leaves a Homebrew-managed service alone
+and prints the `brew services stop` command instead.
+
+### Settings, state and files
+
+Uninstalling keeps the settings and history in
+`~/Library/Application Support/pseudocopy/`, the log at
+`~/Library/Logs/pseudocopy.log`, and the watch folder with its files. Keeping
+them means a later reinstall with the same folder remembers what was already
+copied. To remove them as well:
+
+```sh
+rm -rf ~/Library/Application\ Support/pseudocopy
+rm -f ~/Library/Logs/pseudocopy.log
+```
+
+The watch folder (`~/Temp` by default) and its files are never deleted by
+uninstalling — remove it yourself if it is no longer wanted.
 
 ## Use
 
